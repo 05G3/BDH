@@ -2,5 +2,9 @@
   "accuracy": 0.9730864197530864,
   "precision_macro": 0.9720027914028041,
   "recall_macro": 0.9719777777777777,
-  "f1_macro": 0.971954167956976
+  "f1_macro": 0.971954167956976,
+  "n_params": 1788682,
+  "best_epoch": 26,
+  "val_acc": 0.9711111111111111,
+  "model_type": "bdh"
 }
