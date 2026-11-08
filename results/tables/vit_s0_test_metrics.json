@@ -1,0 +1,10 @@
+{
+  "accuracy": 0.9688888888888889,
+  "precision_macro": 0.9675494211109295,
+  "recall_macro": 0.9671555555555557,
+  "f1_macro": 0.9672457433625377,
+  "n_params": 1812234,
+  "best_epoch": 27,
+  "val_acc": 0.9681481481481482,
+  "model_type": "vit"
+}
