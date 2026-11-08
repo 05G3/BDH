@@ -1,11 +1,3 @@
-# Adapted from Pathway Technology's BDH-GPU (github.com/pathwaycom/bdh),
-# arXiv:2509.26507 "The Dragon Hatchling". Original: causal, byte-level LM.
-# Adaptation for image-patch classification:
-#   - non-causal attention (patches have no sequence order to hide)
-#   - no embedding table / LM head (patch embedding done outside; classifier
-#     head added outside)
-#   - RoPE and weight-tying preserved exactly as in the original
-
 import dataclasses
 import math
 
@@ -19,11 +11,12 @@ class BDHConfig:
     n_layer: int = 4
     n_embd: int = 256
     n_head: int = 4
-    mlp_internal_dim_multiplier: int = 8   # N = mult * n_embd // n_head
+    mlp_internal_dim_multiplier: int = 8
     dropout: float = 0.1
-    causal: bool = False        # False for images (no sequence order)
-    use_rope: bool = True       # True = official RoPE; False = rely on external learned pos-embed
-    tie_weights: bool = True    # True = official behaviour (one weight set, run n_layer times)
+    causal: bool = False
+    use_rope: bool = True
+    tie_weights: bool = True
+    attn_mode: str = "scores"   # "scores": (QK^T)V   |   "state": Q(K^T V)
 
 
 def get_freqs(n, theta, dtype):
@@ -38,10 +31,12 @@ def get_freqs(n, theta, dtype):
 
 class Attention(nn.Module):
     def __init__(self, n_head, n_embd, mlp_internal_dim_multiplier,
-                 use_rope=True, causal=False):
+                 use_rope=True, causal=False, attn_mode="scores"):
         super().__init__()
+        assert attn_mode in ("scores", "state")
         self.use_rope = use_rope
         self.causal = causal
+        self.attn_mode = attn_mode
         N = mlp_internal_dim_multiplier * n_embd // n_head
         if use_rope:
             self.register_buffer(
@@ -70,16 +65,19 @@ class Attention(nn.Module):
             KR = QR
         else:
             QR, KR = Q, K
-        scores = QR @ KR.mT
+
+        if self.attn_mode == "state":
+            assert not self.causal, "state form implemented for non-causal attention only"
+            state = KR.mT @ V          # (B, nh, N, D): sum over patches of k_t^T v_t
+            return QR @ state          # (B, nh, T, D)
+
+        scores = QR @ KR.mT            # (B, nh, T, T)
         if self.causal:
             scores = scores.tril(diagonal=-1)
         return scores @ V
 
 
 class BDH(nn.Module):
-    """BDH-GPU recurrent block, operating on an already-embedded sequence
-    (B, T, D) instead of token ids. Run for config.n_layer steps."""
-
     def __init__(self, config: BDHConfig):
         super().__init__()
         self.config = config
@@ -92,12 +90,17 @@ class BDH(nn.Module):
         self.decoder = nn.Parameter(torch.zeros(n_sets, nh * N, D).normal_(std=0.02))
 
         self.attn = Attention(nh, D, config.mlp_internal_dim_multiplier,
-                              config.use_rope, config.causal)
+                              config.use_rope, config.causal, config.attn_mode)
         self.ln = nn.LayerNorm(D, elementwise_affine=False, bias=False)
         self.drop = nn.Dropout(config.dropout)
 
+        self.record_stats = False   # set True to log activation sparsity per level
+        self.stats = []
+
     def forward(self, x):            # x: (B, T, D)
         B, T, D = x.shape
+        if self.record_stats:
+            self.stats = []
         x = x.unsqueeze(1)           # (B, 1, T, D)
         x = self.ln(x)
 
@@ -105,15 +108,23 @@ class BDH(nn.Module):
             i = 0 if self.config.tie_weights else level
             encoder, encoder_v, decoder = self.encoder[i], self.encoder_v[i], self.decoder[i]
 
-            x_latent = x @ encoder                       # (B, nh, T, N)
+            x_latent = x @ encoder
             x_sparse = F.relu(x_latent)
 
-            yKV = self.attn(Q=x_sparse, K=x_sparse, V=x)  # (B, nh, T, D)
+            yKV = self.attn(Q=x_sparse, K=x_sparse, V=x)
             yKV = self.ln(yKV)
 
             y_latent = yKV @ encoder_v
             y_sparse = F.relu(y_latent)
             xy_sparse = x_sparse * y_sparse
+
+            if self.record_stats:
+                self.stats.append({
+                    "x_sparse": (x_sparse == 0).float().mean().item(),
+                    "y_sparse": (y_sparse == 0).float().mean().item(),
+                    "xy_sparse": (xy_sparse == 0).float().mean().item(),
+                })
+
             xy_sparse = self.drop(xy_sparse)
 
             nh = self.config.n_head
