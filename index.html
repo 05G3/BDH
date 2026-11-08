@@ -1063,13 +1063,14 @@ x  = LN(x + y)                         residual, repeated for 4 levels</pre>
 <div class="scroll"><table>
 <thead><tr><th>Model Configuration</th><th class="n">Accuracy</th><th class="n">Precision</th><th class="n">Recall</th><th class="n">Macro-F1</th><th class="n">Parameters</th></tr></thead>
 <tbody>
-<tr class="highlight"><td>BDH (13 bands, drop 0.1, RoPE)</td><td class="n">97.31%</td><td class="n">97.20%</td><td class="n">97.20%</td><td class="n">97.20%</td><td class="n">1,788,682</td></tr>
-<tr class="highlight"><td>BDH (13 bands, drop 0.5, RoPE)</td><td class="n">97.33%</td><td class="n">97.26%</td><td class="n">97.19%</td><td class="n">97.22%</td><td class="n">1,788,682</td></tr>
-<tr><td>SimpleCNN baseline</td><td class="n pend" colspan="4" style="text-align:center;"><span class="badge-pending">Suite queued</span></td><td class="n">969,930</td></tr>
-<tr><td>SimpleViT baseline</td><td class="n pend" colspan="4" style="text-align:center;"><span class="badge-pending">Suite queued</span></td><td class="n">1,812,234</td></tr>
-<tr><td>BDH without RoPE</td><td class="n pend" colspan="4" style="text-align:center;"><span class="badge-pending">Suite queued</span></td><td class="n">1,805,066</td></tr>
-<tr><td>BDH untied weights (4 sets)</td><td class="n pend" colspan="4" style="text-align:center;"><span class="badge-pending">Suite queued</span></td><td class="n">6,507,274</td></tr>
-<tr><td>BDH RGB only (3 bands)</td><td class="n pend" colspan="4" style="text-align:center;"><span class="badge-pending">Suite queued</span></td><td class="n">1,624,842</td></tr>
+<tr class="highlight"><td>BDH (13 bands, drop 0.1, seed 0)</td><td class="n">97.80%</td><td class="n">97.72%</td><td class="n">97.71%</td><td class="n">97.71%</td><td class="n">1,788,682</td></tr>
+<tr class="highlight"><td>BDH (13 bands, initial run)</td><td class="n">97.31%</td><td class="n">97.20%</td><td class="n">97.20%</td><td class="n">97.20%</td><td class="n">1,788,682</td></tr>
+<tr class="highlight"><td>BDH (13 bands, drop 0.5)</td><td class="n">97.33%</td><td class="n">97.26%</td><td class="n">97.19%</td><td class="n">97.22%</td><td class="n">1,788,682</td></tr>
+<tr><td>SimpleCNN baseline (seed 0)</td><td class="n">98.62%</td><td class="n">98.58%</td><td class="n">98.56%</td><td class="n">98.56%</td><td class="n">969,930</td></tr>
+<tr><td>SimpleViT baseline (seed 0)</td><td class="n">96.89%</td><td class="n">96.75%</td><td class="n">96.72%</td><td class="n">96.72%</td><td class="n">1,812,234</td></tr>
+<tr><td>BDH without RoPE</td><td class="n pend" colspan="4" style="text-align:center;"><span class="badge-pending">Tier 2 queued</span></td><td class="n">1,805,066</td></tr>
+<tr><td>BDH untied weights (4 sets)</td><td class="n pend" colspan="4" style="text-align:center;"><span class="badge-pending">Tier 2 queued</span></td><td class="n">6,507,274</td></tr>
+<tr><td>BDH RGB only (3 bands)</td><td class="n pend" colspan="4" style="text-align:center;"><span class="badge-pending">Tier 2 queued</span></td><td class="n">1,624,842</td></tr>
 </tbody></table></div>
 <p class="cap">The two measured BDH runs differ by only one tile out of 4,050, confirming consistent high performance.</p>
 

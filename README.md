@@ -29,7 +29,11 @@ Adapted from Pathway's BDH-GPU (arXiv:2509.26507, github.com/pathwaycom/bdh);
 differences: non-causal attention, patch embedding and classification head instead of byte LM.
 
 ## Results
-(paste results/tables/summary.md)
+| Config | n_seeds | Accuracy (%) | Precision (%) | Recall (%) | Macro-F1 (%) | Params |
+|---|---|---|---|---|---|---|
+| bdh_main | 1 | 97.80 ± 0.00 | 97.72 ± 0.00 | 97.71 ± 0.00 | 97.71 ± 0.00 | 1,788,682 |
+| cnn | 1 | 98.62 ± 0.00 | 98.58 ± 0.00 | 98.56 ± 0.00 | 98.56 ± 0.00 | 969,930 |
+| vit | 1 | 96.89 ± 0.00 | 96.75 ± 0.00 | 96.72 ± 0.00 | 96.72 ± 0.00 | 1,812,234 |
 
 ## Limitations
 - Not an exact BDH-GPU reproduction; no time-recurrent synaptic state across patches.
