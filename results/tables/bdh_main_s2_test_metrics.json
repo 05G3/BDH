@@ -1,0 +1,10 @@
+{
+  "accuracy": 0.977037037037037,
+  "precision_macro": 0.9757441617684774,
+  "recall_macro": 0.9759333333333334,
+  "f1_macro": 0.9757584215907947,
+  "n_params": 1788682,
+  "best_epoch": 27,
+  "val_acc": 0.9720987654320987,
+  "model_type": "bdh"
+}
