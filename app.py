@@ -179,12 +179,21 @@ def get_samples():
     return jsonify(CACHED_SAMPLES)
 
 
+@app.route("/api/demo_files")
+def get_demo_files():
+    if not os.path.exists("demo_images"):
+        return jsonify([])
+    files = [f for f in os.listdir("demo_images") if f.endswith(".tif")]
+    return jsonify(sorted(files))
+
+
 @app.route("/api/predict", methods=["POST"])
 def predict():
     if MODEL is None:
         return jsonify({"error": "Model not loaded"}), 503
 
     sample_id = request.json.get("sample_id") if request.is_json else None
+    demo_file = request.json.get("demo_file") if request.is_json else None
     
     if sample_id is not None and TEST_IMAGES is not None:
         idx = int(sample_id)
@@ -192,17 +201,38 @@ def predict():
             return jsonify({"error": "Invalid sample_id"}), 400
         raw_img = np.array(TEST_IMAGES[idx])
         true_class = int(TEST_LABELS[idx]) if TEST_LABELS is not None else None
+    elif demo_file:
+        try:
+            import rasterio
+            file_path = os.path.join("demo_images", demo_file)
+            if not os.path.exists(file_path):
+                return jsonify({"error": "Demo file not found"}), 404
+            with rasterio.open(file_path) as src:
+                raw_img = src.read().astype(np.float32)[:13]
+            gt_name = demo_file.split("_")[0]
+            true_class = CLASS_NAMES.index(gt_name) if gt_name in CLASS_NAMES else None
+        except Exception as e:
+            return jsonify({"error": f"Failed to read demo file: {str(e)}"}), 400
     elif "image" in request.files:
         try:
             import rasterio
             file = request.files["image"]
             with rasterio.open(file) as src:
                 raw_img = src.read().astype(np.float32)
+            if raw_img.shape[0] < 13:
+                return jsonify({"error": f"Expected 13 bands, found {raw_img.shape[0]}"}), 400
+            raw_img = raw_img[:13]
             true_class = None
         except Exception as e:
             return jsonify({"error": f"Failed to read rasterio file: {str(e)}"}), 400
     else:
-        return jsonify({"error": "No valid sample_id or image provided"}), 400
+        return jsonify({"error": "No valid sample_id, demo_file or image provided"}), 400
+
+    # Resize if not 64x64
+    if raw_img.shape[1:] != (64, 64):
+        raw_t = torch.from_numpy(raw_img).unsqueeze(0)
+        raw_t = F.interpolate(raw_t, size=(64, 64), mode="bilinear", align_corners=False)
+        raw_img = raw_t.squeeze(0).numpy()
 
     # Normalise
     mean = NORM_STATS["mean_t"]
@@ -234,9 +264,15 @@ def predict():
 
     # RGB composite data URL
     rgb = (band_to_rgb(raw_img) * 255).astype(np.uint8)
-    buf = io.BytesIO()
-    Image.fromarray(rgb).save(buf, format="PNG")
-    b64_rgb = base64.b64encode(buf.getvalue()).decode("utf-8")
+    buf_rgb = io.BytesIO()
+    Image.fromarray(rgb).save(buf_rgb, format="PNG")
+    b64_rgb = base64.b64encode(buf_rgb.getvalue()).decode("utf-8")
+
+    # False-color NIR composite (B08 NIR, B04 Red, B03 Green)
+    nir = (band_to_rgb(raw_img, bands=(7, 3, 2)) * 255).astype(np.uint8)
+    buf_nir = io.BytesIO()
+    Image.fromarray(nir).save(buf_nir, format="PNG")
+    b64_nir = base64.b64encode(buf_nir.getvalue()).decode("utf-8")
 
     return jsonify({
         "predicted_class": CLASS_NAMES[pred_idx],
@@ -248,6 +284,7 @@ def predict():
         "top3": top3,
         "all_probs": all_probs,
         "rgb_base64": f"data:image/png;base64,{b64_rgb}",
+        "nir_base64": f"data:image/png;base64,{b64_nir}",
         "sparsity_stats": stats
     })
 
