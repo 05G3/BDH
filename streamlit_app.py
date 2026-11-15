@@ -512,40 +512,37 @@ def main():
                     is_correct = (predicted_class == gt) if gt else None
                     status_color = "#0A6E6E" if (is_correct is None or is_correct) else "#B91C1C"
 
-                    synth_badge = "<span style='display:inline-block;background:#FEF3C7;color:#B45309;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;margin-bottom:6px;'>EXPERIMENTAL SYNTHETIC INPUT</span><br/>" if is_synth else ""
-
-                    # Output Card
-                    output_html = f"""
-                    <div style="background-color: {status_color}12;
-                                border: 2.5px solid {status_color};
-                                border-radius: 12px;
-                                padding: 22px;
-                                text-align: center;
-                                margin-bottom: 20px;">
-                        {synth_badge}
-                        <span style="font-size: 0.88rem; text-transform: uppercase;
-                                     letter-spacing: 0.05em; color: {status_color};
-                                     font-weight: 700;">
-                            Predicted Land-Use Class
-                        </span>
-                        <h1 style="margin: 8px 0; font-size: 2.6rem;
-                                   color: {status_color};">
-                            {predicted_class}
-                        </h1>
-                        <span style="font-size: 1.25rem; font-weight: 700;">
-                            Prediction Confidence: {confidence*100:.1f}%
-                        </span>
-                        <br/>
-                        <span style="font-size: 0.85rem; color: #666;">
-                            Inference Latency: {latency_ms:.2f} ms ({DEVICE})
-                        </span>
-                        {f"<br/><b style='color:{status_color}; font-size:0.95rem;'>{'✅ Correct Prediction' if is_correct else '⚠️ Ground truth: ' + gt}</b>" if gt else ""}
-                    </div>
-                    """
-                    st.markdown(
-                        textwrap.dedent(output_html).strip(),
-                        unsafe_allow_html=True,
+                    synth_badge = (
+                        "<div style='display:inline-block;background:#FEF3C7;color:#B45309;"
+                        "padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;"
+                        "margin-bottom:8px;'>EXPERIMENTAL SYNTHETIC INPUT</div>"
+                        if is_synth else ""
                     )
+                    gt_badge = (
+                        f"<div style='color:{status_color};font-weight:700;font-size:0.95rem;margin-top:8px;'>"
+                        f"{'✅ Correct Prediction' if is_correct else '⚠️ Ground truth: ' + gt}</div>"
+                        if gt else ""
+                    )
+
+                    # Output Card rendered directly without markdown indentation
+                    output_html = (
+                        f"<div style='background-color:{status_color}14;border:2.5px solid {status_color};"
+                        f"border-radius:12px;padding:22px;text-align:center;margin-bottom:20px;'>"
+                        f"{synth_badge}"
+                        f"<div style='font-size:0.88rem;text-transform:uppercase;letter-spacing:0.05em;"
+                        f"color:{status_color};font-weight:700;'>Predicted Land-Use Class</div>"
+                        f"<h1 style='margin:8px 0;font-size:2.6rem;color:{status_color};'>{predicted_class}</h1>"
+                        f"<div style='font-size:1.25rem;font-weight:700;'>Prediction Confidence: {confidence*100:.1f}%</div>"
+                        f"<div style='font-size:0.85rem;color:#666;margin-top:4px;'>"
+                        f"Inference Latency: {latency_ms:.2f} ms ({DEVICE})</div>"
+                        f"{gt_badge}"
+                        f"</div>"
+                    )
+
+                    if hasattr(st, "html"):
+                        st.html(output_html)
+                    else:
+                        st.markdown(output_html, unsafe_allow_html=True)
 
                     # Class Probabilities Bar Chart
                     st.markdown("#### Softmax Class Probabilities:")
