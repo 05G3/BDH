@@ -1,0 +1,16 @@
+{
+  "status": "PASSED",
+  "precision": "float64",
+  "with_rope_max_diff": 6.88e-15,
+  "without_rope_max_diff": 6.44e-15,
+  "trained_model_256_max_diff": 3.81e-06,
+  "trained_model_prediction_agreement_pct": 100.0,
+  "cost_model": {
+    "N": 512,
+    "D": 256,
+    "scores_formula": "T^2 * (N + D)",
+    "state_formula": "2 * T * N * D",
+    "crossover_tokens": 341,
+    "ratio_at_T64": 5.333333333333334
+  }
+}

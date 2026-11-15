@@ -1,15 +1,28 @@
 import io
 import warnings
-from typing import List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 from PIL import Image
 import torch
 import torch.nn.functional as F
 
-# Canonical 13-band Sentinel-2 order for EuroSAT-MS
+# Canonical 13-band Sentinel-2 order for EuroSAT-MS:
+# Index 0: B01 (Coastal aerosol)
+# Index 1: B02 (Blue)
+# Index 2: B03 (Green)
+# Index 3: B04 (Red)
+# Index 4: B05 (Vegetation red edge 1)
+# Index 5: B06 (Vegetation red edge 2)
+# Index 6: B07 (Vegetation red edge 3)
+# Index 7: B08 (NIR)
+# Index 8: B8A (Narrow NIR)
+# Index 9: B09 (Water vapour)
+# Index 10: B10 (Cirrus)
+# Index 11: B11 (SWIR 1)
+# Index 12: B12 (SWIR 2)
 CANONICAL_SENTINEL2_BANDS = [
-    "B01", "B02", "B03", "B04", "B05", "B06", "B07", "B08", "B09", "B10", "B11", "B12", "B8A"
+    "B01", "B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B09", "B10", "B11", "B12"
 ]
 
 
@@ -22,7 +35,7 @@ def _normalize_band_name(name: str) -> str:
         clean = "B" + clean[4:]
     if clean.startswith("B") and len(clean) == 2 and clean[1].isdigit():
         clean = f"B0{clean[1]}"
-    if clean == "B08A":
+    if clean in ("B08A", "B8A", "BAND8A"):
         clean = "B8A"
     return clean
 
@@ -36,7 +49,9 @@ def validate_geotiff_bands(
     Validates a multi-spectral Sentinel-2 array for BDH model compatibility:
     1. Verifies 3D structure (C, H, W) and minimum 13 spectral bands.
     2. Validates and handles NaN, Inf, and NoData pixels.
-    3. Validates band order if band descriptions/tags exist (reordering to canonical order if possible).
+    3. Validates band order against canonical EuroSAT-MS order:
+       [B01, B02, B03, B04, B05, B06, B07, B08, B8A, B09, B10, B11, B12]
+       (reorders if band descriptions are present and permuted).
     4. Validates reflectance scale against EuroSAT training distribution (converts [0, 1] reflectance to DN ~10,000 scale).
     """
     if arr.ndim != 3:
@@ -46,7 +61,7 @@ def validate_geotiff_bands(
     if n_bands < 13:
         raise ValueError(
             f"GeoTIFF contains only {n_bands} bands. BDH requires all 13 Sentinel-2 spectral bands "
-            f"({', '.join(CANONICAL_SENTINEL2_BANDS)})."
+            f"in EuroSAT order ({', '.join(CANONICAL_SENTINEL2_BANDS)})."
         )
 
     # 1. Check for NaN and Inf values
@@ -135,23 +150,68 @@ def pad_to_min_dimensions(
     return arr, (H, W)
 
 
-def load_geotiff(file_or_bytes: Union[str, bytes, io.BytesIO]) -> np.ndarray:
-    """Reads and validates a Sentinel-2 GeoTIFF from path or in-memory bytes."""
+def load_geotiff(
+    file_or_bytes: Union[str, bytes, io.BytesIO],
+    return_meta: bool = False,
+) -> Union[np.ndarray, Tuple[np.ndarray, Dict[str, Any]]]:
+    """
+    Reads and validates a Sentinel-2 GeoTIFF from path or in-memory bytes.
+    Validates band count, order, reflectance scale, and inspects spatial resolution and CRS.
+    
+    If return_meta=True, returns (validated_arr, metadata_dict).
+    If return_meta=False, returns validated_arr.
+    """
     import rasterio
     if isinstance(file_or_bytes, (bytes, bytearray)):
         file_or_bytes = io.BytesIO(file_or_bytes)
+
     with rasterio.open(file_or_bytes) as src:
         arr = src.read().astype(np.float32)
         band_names = list(src.descriptions) if src.descriptions else None
         nodatavals = src.nodatavals
-    return validate_geotiff_bands(arr, band_names=band_names, nodatavals=nodatavals)
+        crs_str = str(src.crs) if src.crs else None
+        res_tuple = (float(src.res[0]), float(src.res[1])) if src.res else None
+
+        meta = {
+            "crs": crs_str,
+            "res": res_tuple,
+            "bounds": tuple(src.bounds) if src.bounds else None,
+            "transform": list(src.transform) if src.transform else None,
+            "descriptions": src.descriptions,
+            "warnings": [],
+        }
+
+        # Validate spatial resolution & CRS
+        if res_tuple is not None:
+            rx, ry = res_tuple
+            if src.crs and src.crs.is_geographic:
+                meta["warnings"].append(
+                    f"Dataset is in angular coordinates (degrees, {crs_str}). "
+                    "EuroSAT training tiles use metric UTM projections (~10m/pixel ground sampling distance)."
+                )
+            elif rx > 0:
+                if rx < 7.0 or rx > 15.0:
+                    meta["warnings"].append(
+                        f"Spatial resolution ({rx:.1f}m × {ry:.1f}m/pixel) differs from EuroSAT's native 10m/pixel Sentinel-2 resolution. "
+                        "Receptive field scale mismatch may affect classification accuracy."
+                    )
+        else:
+            meta["warnings"].append("Spatial resolution metadata missing from GeoTIFF.")
+
+        if not crs_str:
+            meta["warnings"].append("Coordinate Reference System (CRS) metadata missing from GeoTIFF.")
+
+    validated = validate_geotiff_bands(arr, band_names=band_names, nodatavals=nodatavals)
+    if return_meta:
+        return validated, meta
+    return validated
 
 
 def load_rgb_image(file_or_bytes: Union[str, bytes, io.BytesIO], mean_vals: List[float]) -> np.ndarray:
     """
     Reads an RGB image (PNG, JPG) and prepares an EXPERIMENTAL synthetic 13-band Sentinel-2 representation:
-    - Red -> Band 4 (B04), Green -> Band 3 (B03), Blue -> Band 2 (B02).
-    - Estimates Near-Infrared B08 based on green/red reflectance heuristic.
+    - Red -> Band 4 (B04, index 3), Green -> Band 3 (B03, index 2), Blue -> Band 2 (B02, index 1).
+    - Estimates Near-Infrared B08 (index 7) and Narrow NIR B8A (index 8).
     - Fills other spectral bands (Red Edge, SWIR, etc.) with dataset training mean statistics.
     
     NOTE: This is strictly an experimental heuristic for qualitative UI demonstration.
@@ -175,10 +235,11 @@ def load_rgb_image(file_or_bytes: Union[str, bytes, io.BytesIO], mean_vals: List
 
     # Approximate reflectance scale from dataset means
     scale = (mean_vals[3] + mean_vals[2] + mean_vals[1]) / (3.0 * 128.0)
-    arr[3] = rgb[:, :, 0] * scale  # B04 (Red)
-    arr[2] = rgb[:, :, 1] * scale  # B03 (Green)
-    arr[1] = rgb[:, :, 2] * scale  # B02 (Blue)
-    arr[7] = np.maximum(arr[3], arr[2]) * 1.3  # B08 (NIR proxy)
+    arr[3] = rgb[:, :, 0] * scale  # B04 (Red, index 3)
+    arr[2] = rgb[:, :, 1] * scale  # B03 (Green, index 2)
+    arr[1] = rgb[:, :, 2] * scale  # B02 (Blue, index 1)
+    arr[7] = np.maximum(arr[3], arr[2]) * 1.3  # B08 (NIR proxy, index 7)
+    arr[8] = arr[7] * 0.95                     # B8A (Narrow NIR proxy, index 8 in EuroSAT order)
     return arr
 
 

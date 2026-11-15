@@ -140,34 +140,16 @@ def get_sparsity():
     if os.path.exists(csv_path):
         df = pd.read_csv(csv_path)
         return jsonify(df.to_dict(orient="records"))
-    return jsonify([
-        {"level": 1, "x_sparse_%zeros": 54.24, "y_sparse_%zeros": 52.76, "xy_sparse_%zeros": 88.53},
-        {"level": 2, "x_sparse_%zeros": 65.20, "y_sparse_%zeros": 60.78, "xy_sparse_%zeros": 92.74},
-        {"level": 3, "x_sparse_%zeros": 68.89, "y_sparse_%zeros": 64.85, "xy_sparse_%zeros": 93.41},
-        {"level": 4, "x_sparse_%zeros": 68.27, "y_sparse_%zeros": 64.67, "xy_sparse_%zeros": 92.25}
-    ])
+    return jsonify({"status": "Not available", "error": "Sparsity results not found. Run experiments/measure_sparsity.py."}), 404
 
 
 @app.route("/api/equivalence")
 def get_equivalence():
-    N, D = 512, 256
-    crossover = 2 * N * D / (N + D)
-    return jsonify({
-        "status": "PASSED",
-        "precision": "float64",
-        "with_rope_max_diff": 6.88e-15,
-        "without_rope_max_diff": 6.44e-15,
-        "trained_model_256_max_diff": 3.81e-06,
-        "trained_model_prediction_agreement_pct": 100.0,
-        "cost_model": {
-            "N": N,
-            "D": D,
-            "scores_formula": "T^2 * (N + D)",
-            "state_formula": "2 * T * N * D",
-            "crossover_tokens": round(crossover),
-            "ratio_at_T64": (2 * 64 * N * D) / (64 * 64 * (N + D))
-        }
-    })
+    json_path = "results/tables/equivalence.json"
+    if os.path.exists(json_path):
+        with open(json_path, "r") as f:
+            return jsonify(json.load(f))
+    return jsonify({"status": "Not available", "error": "Equivalence verification results not found. Run experiments/test_equivalence.py."}), 404
 
 
 @app.route("/api/samples")
@@ -204,9 +186,11 @@ def predict():
             if not os.path.exists(file_path):
                 return jsonify({"error": "Demo file not found"}), 404
             with rasterio.open(file_path) as src:
-                raw_img = src.read().astype(np.float32)[:13]
-            gt_name = demo_file.split("_")[0]
-            true_class = CLASS_NAMES.index(gt_name) if gt_name in CLASS_NAMES else None
+                raw_img = src.read().astype(np.float32)
+                band_names = list(src.descriptions) if src.descriptions else None
+                nodatavals = src.nodatavals
+            raw_img = validate_geotiff_bands(raw_img, band_names=band_names, nodatavals=nodatavals)
+            true_class = None  # Ground truth is NOT inferred from filename
         except Exception as e:
             return jsonify({"error": f"Failed to read demo file: {str(e)}"}), 400
     elif "image" in request.files:

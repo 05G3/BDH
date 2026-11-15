@@ -157,13 +157,16 @@ def main():
 
         # Display actual evaluation metrics or explicit 'Not available'
         if eval_metrics and "accuracy" in eval_metrics:
-            acc_pct = eval_metrics["accuracy"] * 100.0
-            f1_pct = eval_metrics.get("f1_macro", 0.0) * 100.0
+            acc_val = eval_metrics["accuracy"]
+            f1_val = eval_metrics.get("f1_macro")
             col_m1, col_m2 = st.columns(2)
             with col_m1:
-                st.metric("Test Accuracy", f"{acc_pct:.2f}%")
+                st.metric("Test Accuracy", f"{acc_val * 100.0:.2f}%")
             with col_m2:
-                st.metric("Macro-F1", f"{f1_pct:.2f}%")
+                if f1_val is not None and isinstance(f1_val, (int, float)):
+                    st.metric("Macro-F1", f"{f1_val * 100.0:.2f}%")
+                else:
+                    st.metric("Macro-F1", "Not available")
             st.caption(f"Metrics Source: `{eval_metrics.get('source_file')}`")
         else:
             col_m1, col_m2 = st.columns(2)
@@ -253,8 +256,11 @@ def main():
             fname = uploaded_file.name.lower()
             try:
                 if fname.endswith((".tif", ".tiff")):
-                    arr = load_geotiff(file_bytes)
+                    arr, meta = load_geotiff(file_bytes, return_meta=True)
                     st.session_state.is_synthetic_rgb = False
+                    if meta.get("warnings"):
+                        for w in meta["warnings"]:
+                            st.warning(f"⚠️ GeoTIFF Metadata Notice: {w}")
                 else:
                     arr = load_rgb_image(file_bytes, mean_list)
                     st.session_state.is_synthetic_rgb = True
@@ -297,26 +303,27 @@ def main():
             with col_d_btn:
                 st.markdown("<div style='height:28px;'></div>", unsafe_allow_html=True)
                 if st.button("📥 Load Demo File", key="btn_load_demo", use_container_width=True):
-                    arr = load_geotiff(os.path.join("demo_images", chosen_demo))
+                    arr, meta = load_geotiff(os.path.join("demo_images", chosen_demo), return_meta=True)
                     _, H, W = arr.shape
                     is_multi = (H > 64 or W > 64)
                     st.session_state.input_array = arr
                     st.session_state.is_multi_tile_scene = is_multi
                     st.session_state.is_synthetic_rgb = False
+                    st.session_state.ground_truth_class = None  # Verified ground truth not inferred from filename
                     st.session_state.scene_results = None
                     st.session_state.single_results = None
 
                     if is_multi:
-                        st.session_state.ground_truth_class = None
                         st.session_state.input_source_desc = (
-                            f"Composite Multi-Class Scene: `{chosen_demo}` ({H}×{W}px, {arr.shape[0]} bands)"
+                            f"Demo Multi-Tile Scene: `{chosen_demo}` ({H}×{W}px, {arr.shape[0]} bands)"
                         )
                     else:
-                        gt_name = chosen_demo.split("_")[0]
-                        st.session_state.ground_truth_class = gt_name
                         st.session_state.input_source_desc = (
-                            f"Demo Tile: `{chosen_demo}` (Expected Class: **{gt_name}**)"
+                            f"Demo Tile: `{chosen_demo}` ({H}×{W}px, {arr.shape[0]} bands)"
                         )
+                    if meta.get("warnings"):
+                        for w in meta["warnings"]:
+                            st.info(f"ℹ️ {w}")
                     st.success(f"Loaded {chosen_demo} ({H}×{W}px)!")
 
     # -------------------------------------------------------------------------
@@ -344,7 +351,10 @@ def main():
                 "ℹ️ **Spatial Mapping Note**: BDH is a patch-level classifier trained on 64×64 EuroSAT satellite tiles "
                 "(10m ground sampling distance, 640m×640m footprint). The output is a **tile-based land-cover classification map** "
                 "(each 64×64 spatial patch displays its dominant predicted class), **not** a pixel-wise semantic segmentation map. "
-                "Pixel-level segmentation requires dense prediction models (e.g. U-Net) trained on per-pixel annotated masks."
+                "Pixel-level segmentation requires dense prediction models (e.g. U-Net) trained on per-pixel annotated masks.\n\n"
+                "**Boundary Overlap Notice**: When scene dimensions are not an exact multiple of the 64px stride, "
+                "the boundary tile shifts backward to fully cover edge pixels. Predictions in overlap zones represent patch-level categorical "
+                "aggregations, not pixel-level evidence or exact geodetic area measurements."
             )
 
             tiles, coords, orig_shape = extract_sliding_tiles(input_array, tile_size=64, stride=64)
