@@ -218,7 +218,7 @@ def predict():
         cy, cx = H // 2, W // 2
         raw_img = raw_img[:, cy - 32 : cy + 32, cx - 32 : cx + 32]
         notice = (
-            f"Scene ({H}x{W}) larger than single tile. Evaluated center 64x64 patch to preserve native 10m resolution. "
+            f"Scene ({H}x{W}) larger than single tile. Evaluated center 64x64 patch to match the model's receptive field without spatial distortion. "
             "Use the primary Streamlit application (streamlit run streamlit_app.py) for full multi-tile sliding-window mapping."
         )
 

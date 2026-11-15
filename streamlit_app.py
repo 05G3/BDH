@@ -233,6 +233,7 @@ def main():
                     st.session_state.ground_truth_class = sample_data["class_name"]
                     st.session_state.is_multi_tile_scene = False
                     st.session_state.is_synthetic_rgb = False
+                    st.session_state.spatial_res_desc = "10.0m/pixel (EuroSAT native Sentinel-2)"
                     st.session_state.scene_results = None
                     st.session_state.single_results = None
                     st.session_state.input_source_desc = (
@@ -258,12 +259,18 @@ def main():
                 if fname.endswith((".tif", ".tiff")):
                     arr, meta = load_geotiff(file_bytes, return_meta=True)
                     st.session_state.is_synthetic_rgb = False
+                    meta_res = meta.get("res")
+                    if meta_res and meta_res[0] > 0 and (meta.get("crs") and not meta["crs"].startswith("EPSG:4326")):
+                        st.session_state.spatial_res_desc = f"{meta_res[0]:.1f}m/pixel"
+                    else:
+                        st.session_state.spatial_res_desc = "unspecified in metadata (assumed ~10m/pixel scale)"
                     if meta.get("warnings"):
                         for w in meta["warnings"]:
                             st.warning(f"⚠️ GeoTIFF Metadata Notice: {w}")
                 else:
                     arr = load_rgb_image(file_bytes, mean_list)
                     st.session_state.is_synthetic_rgb = True
+                    st.session_state.spatial_res_desc = "uncalibrated RGB pixels (not Sentinel-2 GSD)"
                     st.warning(
                         "⚠️ **Experimental Demonstration Mode (Synthetic Spectral Bands)**: "
                         "You uploaded a 3-band RGB image. Synthetic bands (including NIR and SWIR) were mathematically approximated "
@@ -310,6 +317,7 @@ def main():
                     st.session_state.is_multi_tile_scene = is_multi
                     st.session_state.is_synthetic_rgb = False
                     st.session_state.ground_truth_class = None  # Verified ground truth not inferred from filename
+                    st.session_state.spatial_res_desc = "10.0m/pixel (EuroSAT native Sentinel-2)"
                     st.session_state.scene_results = None
                     st.session_state.single_results = None
 
@@ -347,11 +355,12 @@ def main():
             st.subheader(f"🗺️ Multi-Tile Satellite Scene ({H}×{W} pixels)")
             st.caption(st.session_state.input_source_desc)
 
+            res_desc = st.session_state.get("spatial_res_desc", "assumed ~10m/pixel")
             st.info(
-                "ℹ️ **Spatial Mapping Note**: BDH is a patch-level classifier trained on 64×64 EuroSAT satellite tiles "
-                "(10m ground sampling distance, 640m×640m footprint). The output is a **tile-based land-cover classification map** "
-                "(each 64×64 spatial patch displays its dominant predicted class), **not** a pixel-wise semantic segmentation map. "
-                "Pixel-level segmentation requires dense prediction models (e.g. U-Net) trained on per-pixel annotated masks.\n\n"
+                "ℹ️ **Spatial Mapping Note**: BDH is a patch-level classifier trained on 64×64 EuroSAT satellite tiles. "
+                "EuroSAT training tiles were acquired at native Sentinel-2 resolution (10m ground sampling distance, yielding a "
+                "640m×640m footprint per tile). The output across large scenes is a **tile-based land-cover classification map** "
+                "(each 64×64 patch displays its dominant predicted class), **not** a pixel-wise semantic segmentation map.\n\n"
                 "**Boundary Overlap Notice**: When scene dimensions are not an exact multiple of the 64px stride, "
                 "the boundary tile shifts backward to fully cover edge pixels. Predictions in overlap zones represent patch-level categorical "
                 "aggregations, not pixel-level evidence or exact geodetic area measurements."
@@ -360,7 +369,8 @@ def main():
             tiles, coords, orig_shape = extract_sliding_tiles(input_array, tile_size=64, stride=64)
             st.markdown(
                 f"**Sliding Window Pipeline:** Decomposed {H}×{W} scene into **{len(tiles)} standard 64×64 patches** "
-                f"(stride 64px) to preserve native 10m/pixel spatial resolution without distortion."
+                f"(stride 64px) to match BDH's 64×64 receptive field without spatial resampling. "
+                f"(Input resolution: **{res_desc}**)."
             )
 
             col_s_left, col_s_right = st.columns([1, 1], gap="medium")
@@ -466,7 +476,7 @@ def main():
                     )
 
                 if H < 64 or W < 64:
-                    st.info(f"Tile dimensions: `{arr.shape[0]} bands, {H}×{W}px` (padded to 64×64 for BDH receptive field)")
+                    st.info(f"Tile dimensions: `{input_array.shape[0]} bands, {H}×{W}px` (padded to 64×64 for BDH receptive field)")
                 else:
                     st.info(f"Tensor Dimensions: `(13, {H}, {W})` • Patches: 64 ($8\\times 8$ grid) • Embedding: 256-dim")
 

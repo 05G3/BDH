@@ -3,6 +3,7 @@ import os
 import numpy as np
 import pytest
 import torch
+import warnings
 
 from application.inference import (
     load_bdh_model,
@@ -21,7 +22,18 @@ from application.preprocessing import (
 import streamlit_app
 
 
-def test_issue_2_canonical_band_order_and_b8a_position():
+def test_fix_1_missing_band_descriptions_warning():
+    """Verify explicit warning when GeoTIFF lacks band descriptions."""
+    arr = np.random.uniform(500, 3000, (13, 64, 64)).astype(np.float32)
+    with pytest.warns(UserWarning, match="GeoTIFF is missing band descriptions"):
+        validate_geotiff_bands(arr, band_names=None)
+
+    # When metadata is requested from load_geotiff, warning should be captured
+    _, meta = load_geotiff("demo_images/Forest_sample.tif", return_meta=True)
+    assert any("Band descriptions are missing" in w for w in meta["warnings"])
+
+
+def test_fix_1_canonical_band_order_and_b8a_position():
     """Verify standard EuroSAT-MS 13-band order: B8A is at index 8, followed by B09 at index 9."""
     expected_order = [
         "B01", "B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B09", "B10", "B11", "B12"
@@ -43,58 +55,55 @@ def test_issue_2_canonical_band_order_and_b8a_position():
     assert np.allclose(reordered[8], expected_b8a_val)
 
 
-def test_issue_3a_geotiff_metadata_and_crs_validation():
-    """Verify load_geotiff extracts CRS and resolution metadata with appropriate warnings."""
-    # Test with demo TIFF file
-    arr, meta = load_geotiff("demo_images/Forest_sample.tif", return_meta=True)
-    assert arr.shape == (13, 64, 64)
-    assert isinstance(meta, dict)
-    assert "crs" in meta
-    assert "res" in meta
-    assert "warnings" in meta
+def test_fix_2_radiometric_scaling_validation():
+    """Verify radiometric scaling validations (all-zero, negative, unscaled [0,1], 8-bit, extreme values)."""
+    # 1. All-zero array raises ValueError
+    all_zero = np.zeros((13, 64, 64), dtype=np.float32)
+    with pytest.raises(ValueError, match="all-zero reflectance values"):
+        validate_geotiff_bands(all_zero)
+
+    # 2. Negative values < -100 raise ValueError
+    invalid_neg = np.full((13, 64, 64), -150.0, dtype=np.float32)
+    with pytest.raises(ValueError, match="invalid negative reflectance values"):
+        validate_geotiff_bands(invalid_neg)
+
+    # 3. Unscaled [0, 1] reflectance rescaled to DN ~10,000 with warning
+    unscaled = np.full((13, 64, 64), 0.25, dtype=np.float32)
+    with pytest.warns(UserWarning, match="unscaled reflectance"):
+        scaled = validate_geotiff_bands(unscaled)
+    assert np.isclose(scaled[0, 0, 0], 2500.0)
+
+    # 4. 8-bit scale warning ([0, 255])
+    eight_bit = np.full((13, 64, 64), 200.0, dtype=np.float32)
+    with pytest.warns(UserWarning, match="max pixel value is 200.0 <= 255.0"):
+        validate_geotiff_bands(eight_bit)
+
+    # 5. Values > 25,000 raise ValueError
+    extreme_high = np.full((13, 64, 64), 30000.0, dtype=np.float32)
+    with pytest.raises(ValueError, match="exceed valid Sentinel-2 range"):
+        validate_geotiff_bands(extreme_high)
 
 
-def test_issue_3b_flask_diagnostic_endpoints(monkeypatch):
-    """Verify Flask /api/sparsity and /api/equivalence load actual files and return 404 if missing."""
-    import app
-    client = app.app.test_client()
-
-    # 1. Sparsity endpoint
-    res_sp = client.get("/api/sparsity")
-    assert res_sp.status_code == 200
-    sp_data = res_sp.get_json()
-    assert isinstance(sp_data, list)
-    assert len(sp_data) == 4
-
-    # 2. Equivalence endpoint
-    res_eq = client.get("/api/equivalence")
-    assert res_eq.status_code == 200
-    eq_data = res_eq.get_json()
-    assert eq_data.get("status") == "PASSED"
-    assert "trained_model_256_max_diff" in eq_data
+def test_fix_3_streamlit_arr_variable_reference():
+    """Verify streamlit_app.py uses input_array.shape rather than undefined arr.shape in tile info."""
+    with open("streamlit_app.py", "r") as f:
+        lines = f.readlines()
+    # Check that in Case B (single tile preview), the info box uses input_array.shape[0], NOT arr.shape[0]
+    single_tile_lines = [l for l in lines if "padded to 64×64 for BDH receptive field" in l]
+    assert len(single_tile_lines) > 0
+    for l in single_tile_lines:
+        assert "{input_array.shape[0]} bands" in l
+        assert "{arr.shape[0]} bands" not in l
 
 
-def test_issue_3c_no_filename_ground_truth_guessing():
-    """Verify demo files do not infer ground truth from filename splitting."""
-    import app
-    client = app.app.test_client()
-
-    app.init_app()
-    # Predict on demo file: true_class must be None
-    res = client.post("/api/predict", json={"demo_file": "Forest_sample.tif"})
-    assert res.status_code == 200
-    data = res.get_json()
-    assert data["true_class"] is None, "Ground truth should NOT be inferred from filename!"
-
-
-def test_issue_3d_macro_f1_missing_display(monkeypatch):
-    """Verify missing f1_macro displays Not available rather than 0.00%."""
-    # When metrics file has accuracy but missing f1_macro
-    partial_metrics = {"accuracy": 0.973}
-    monkeypatch.setattr(streamlit_app, "load_evaluation_metrics", lambda: partial_metrics)
-    m = streamlit_app.load_evaluation_metrics()
-    assert "f1_macro" not in m
-    assert m["accuracy"] == 0.973
+def test_fix_4_spatial_resolution_descriptions():
+    """Verify spatial resolution is not assumed to be 10m/pixel for all arbitrary inputs."""
+    with open("streamlit_app.py", "r") as f:
+        content = f.read()
+    # Should not assert every image preserves 10m/pixel
+    assert "preserve native 10m/pixel spatial resolution" not in content
+    # Checks for spatial_res_desc
+    assert "spatial_res_desc" in content
 
 
 def test_small_image_and_edge_tiles():

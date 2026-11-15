@@ -99,33 +99,48 @@ def validate_geotiff_bands(
         else:
             present = [n for n in norm_names if n in CANONICAL_SENTINEL2_BANDS]
             missing = [cb for cb in CANONICAL_SENTINEL2_BANDS if cb not in norm_names]
-            if len(missing) > 0 and len(present) < 13:
+            if len(missing) > 0:
                 warnings.warn(
                     f"Band metadata incomplete or non-standard. Missing expected Sentinel-2 bands: {missing}. "
                     "Assuming default EuroSAT 13-band sequential indexing."
                 )
+    else:
+        warnings.warn(
+            "GeoTIFF is missing band descriptions. Assuming standard EuroSAT-MS 13-band order "
+            f"({', '.join(CANONICAL_SENTINEL2_BANDS)}). If bands are in a different sequence, predictions will be inaccurate."
+        )
 
-    # 4. Validate reflectance scale against training data distribution
+    # 4. Validate reflectance scale against EuroSAT training data distribution
     max_val = float(np.max(validated_arr))
     min_val = float(np.min(validated_arr))
 
-    if min_val < -500.0:
+    if max_val == 0.0 and min_val == 0.0:
+        raise ValueError("GeoTIFF contains all-zero reflectance values across all spectral bands.")
+
+    if min_val < -100.0:
         raise ValueError(
-            f"GeoTIFF contains invalid negative reflectance values (minimum: {min_val:.2f}). "
+            f"GeoTIFF contains invalid negative reflectance values (minimum: {min_val:.2f} < -100). "
             "Please check radiometric calibration."
         )
+    elif min_val < 0.0:
+        validated_arr = np.clip(validated_arr, 0.0, None)
 
     # If image is in unscaled surface reflectance [0.0, 1.0] (or [0.0, 2.0] for clouds/specular)
-    if 0.0 <= max_val <= 2.0:
+    if 0.0 < max_val <= 2.0:
         warnings.warn(
             f"GeoTIFF appears to be in unscaled reflectance [0, 1] (max={max_val:.3f}). "
             "Rescaling by 10,000 to match EuroSAT Sentinel-2 Digital Number (DN) scale."
         )
         validated_arr = validated_arr * 10000.0
-    elif max_val > 65535.0:
+    elif 2.0 < max_val <= 255.0:
+        warnings.warn(
+            f"GeoTIFF max pixel value is {max_val:.1f} <= 255.0. EuroSAT expects Sentinel-2 Digital Numbers "
+            "with reflectance scaled to ~10,000 (mean ~1000-2500). If this is an 8-bit image, model predictions will be unreliable."
+        )
+    elif max_val > 25000.0:
         raise ValueError(
-            f"GeoTIFF reflectance scale exceeds 16-bit radiometric limits (max={max_val:.1f}). "
-            "Data scale is incompatible with trained BDH weights."
+            f"GeoTIFF reflectance values exceed valid Sentinel-2 range (max={max_val:.1f} > 25,000). "
+            "EuroSAT model expects reflectance scaled to DN ~10,000."
         )
 
     return validated_arr
@@ -200,6 +215,12 @@ def load_geotiff(
 
         if not crs_str:
             meta["warnings"].append("Coordinate Reference System (CRS) metadata missing from GeoTIFF.")
+
+        if not band_names or not any(n for n in band_names):
+            meta["warnings"].append(
+                "Band descriptions are missing from GeoTIFF. Standard EuroSAT 13-band order "
+                f"({', '.join(CANONICAL_SENTINEL2_BANDS)}) is assumed."
+            )
 
     validated = validate_geotiff_bands(arr, band_names=band_names, nodatavals=nodatavals)
     if return_meta:
