@@ -14,6 +14,7 @@ from PIL import Image
 
 from models.classifier import BDHClassifier
 from utils.visualization import band_to_rgb
+from application.preprocessing import validate_geotiff_bands, pad_to_min_dimensions
 
 app = Flask(__name__, static_folder="results", static_url_path="/results")
 
@@ -123,13 +124,8 @@ def get_metrics():
         with open(metrics_path) as f:
             data["overall"] = json.load(f)
     else:
-        data["overall"] = {
-            "accuracy": 0.973086,
-            "precision_macro": 0.972002,
-            "recall_macro": 0.971977,
-            "f1_macro": 0.971954,
-            "n_params": 1788682
-        }
+        data["overall"] = None
+        data["status"] = "Not available"
 
     if os.path.exists(per_class_path):
         df = pd.read_csv(per_class_path, index_col=0)
@@ -219,20 +215,28 @@ def predict():
             file = request.files["image"]
             with rasterio.open(file) as src:
                 raw_img = src.read().astype(np.float32)
-            if raw_img.shape[0] < 13:
-                return jsonify({"error": f"Expected 13 bands, found {raw_img.shape[0]}"}), 400
-            raw_img = raw_img[:13]
+                band_names = list(src.descriptions) if src.descriptions else None
+                nodatavals = src.nodatavals
+            raw_img = validate_geotiff_bands(raw_img, band_names=band_names, nodatavals=nodatavals)
             true_class = None
         except Exception as e:
-            return jsonify({"error": f"Failed to read rasterio file: {str(e)}"}), 400
+            return jsonify({"error": f"GeoTIFF validation error: {str(e)}"}), 400
     else:
         return jsonify({"error": "No valid sample_id, demo_file or image provided"}), 400
 
-    # Resize if not 64x64
-    if raw_img.shape[1:] != (64, 64):
-        raw_t = torch.from_numpy(raw_img).unsqueeze(0)
-        raw_t = F.interpolate(raw_t, size=(64, 64), mode="bilinear", align_corners=False)
-        raw_img = raw_t.squeeze(0).numpy()
+    notice = None
+    # Preserve 10m/pixel spatial resolution: pad if smaller, center-crop if larger
+    H, W = raw_img.shape[1], raw_img.shape[2]
+    if H < 64 or W < 64:
+        raw_img, _ = pad_to_min_dimensions(raw_img, min_h=64, min_w=64)
+        notice = f"Input spatial dimensions ({H}x{W}) padded with edge replication to 64x64."
+    elif H > 64 or W > 64:
+        cy, cx = H // 2, W // 2
+        raw_img = raw_img[:, cy - 32 : cy + 32, cx - 32 : cx + 32]
+        notice = (
+            f"Scene ({H}x{W}) larger than single tile. Evaluated center 64x64 patch to preserve native 10m resolution. "
+            "Use the primary Streamlit application (streamlit run streamlit_app.py) for full multi-tile sliding-window mapping."
+        )
 
     # Normalise
     mean = NORM_STATS["mean_t"]
@@ -285,7 +289,8 @@ def predict():
         "all_probs": all_probs,
         "rgb_base64": f"data:image/png;base64,{b64_rgb}",
         "nir_base64": f"data:image/png;base64,{b64_nir}",
-        "sparsity_stats": stats
+        "sparsity_stats": stats,
+        "notice": notice
     })
 
 

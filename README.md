@@ -41,7 +41,7 @@ python app.py --port 5050
 ### Features:
 - **Benchmark Test Split**: Test tiles with known ground truth from EuroSAT-MS.
 - **Multi-Spectral GeoTIFFs**: Supports full 13-band Sentinel-2 inputs (B01–B12 + B8A).
-- **Sliding-Window Scene Mapping**: Automatically splits large satellite scenes ($H, W > 64$) into 64×64 patches and generates a 2D land-cover segmentation map and composition breakdown.
+- **Sliding-Window Scene Mapping**: Automatically splits large satellite scenes ($H, W > 64$) into 64×64 patches to generate a 2D tile-based land-cover classification map and composition breakdown without spatial distortion. (Note: BDH produces patch-level classifications aggregated across the scene, distinct from pixel-wise semantic segmentation).
 - **BDH Diagnostics**: Live measurement of post-ReLU activation sparsity (~92–93% zeros) across the 4 tied levels.
 
 ## Attention Complexity Clarification

@@ -30,35 +30,42 @@ def get_nir_preview(arr: np.ndarray) -> np.ndarray:
     return band_to_rgb(arr, bands=(7, 3, 2))
 
 
-def render_landcover_map(seg_map: np.ndarray) -> Image.Image:
-    """Renders a 2D integer class map into a colorized RGB land-cover map."""
-    H, W = seg_map.shape
+def render_landcover_map(tile_map: np.ndarray) -> Image.Image:
+    """Renders a 2D integer class map into a colorized RGB tile-based land-cover map."""
+    H, W = tile_map.shape
     colored = np.zeros((H, W, 3), dtype=np.uint8)
     for c_id, color in CLASS_PALETTE.items():
-        mask = seg_map == c_id
+        mask = tile_map == c_id
         colored[mask] = color
     return Image.fromarray(colored)
 
 
 def create_segmented_overlay(
     rgb_composite: np.ndarray,
-    seg_map: np.ndarray,
+    tile_map: np.ndarray,
     alpha: float = 0.45,
 ) -> Image.Image:
-    """Blends the colorized land-cover segmentation map on top of the true-color satellite imagery."""
+    """
+    Blends the colorized tile-based land-cover classification map on top of true-color satellite imagery.
+    alpha: blending weight for classification colors (0 = only satellite imagery, 1 = only class colors).
+    """
     H, W, _ = rgb_composite.shape
     base_rgb = (np.clip(rgb_composite, 0, 1) * 255).astype(np.uint8)
     color_map = np.zeros((H, W, 3), dtype=np.uint8)
 
     for c_id, color in CLASS_PALETTE.items():
-        mask = seg_map == c_id
+        mask = tile_map == c_id
         color_map[mask] = color
 
     # Blend where valid prediction exists
-    valid_mask = seg_map >= 0
+    valid_mask = tile_map >= 0
     blended = base_rgb.copy()
     blended[valid_mask] = (
         (1.0 - alpha) * base_rgb[valid_mask] + alpha * color_map[valid_mask]
     ).astype(np.uint8)
 
     return Image.fromarray(blended)
+
+
+# Semantic alias
+create_landcover_overlay = create_segmented_overlay

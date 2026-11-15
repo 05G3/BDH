@@ -2,7 +2,7 @@ import io
 import json
 import os
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -20,6 +20,7 @@ from application.preprocessing import (
     load_rgb_image,
     extract_sliding_tiles,
     normalize_batch,
+    pad_to_min_dimensions,
 )
 from application.visualization import (
     CLASS_PALETTE,
@@ -64,6 +65,8 @@ if "ground_truth_class" not in st.session_state:
     st.session_state.ground_truth_class = None
 if "is_multi_tile_scene" not in st.session_state:
     st.session_state.is_multi_tile_scene = False
+if "is_synthetic_rgb" not in st.session_state:
+    st.session_state.is_synthetic_rgb = False
 if "scene_results" not in st.session_state:
     st.session_state.scene_results = None
 if "single_results" not in st.session_state:
@@ -91,19 +94,22 @@ def load_normalization_stats() -> Tuple[torch.Tensor, torch.Tensor, List[float]]
 
 
 @st.cache_data(show_spinner=False)
-def load_evaluation_metrics() -> Dict[str, float]:
-    """Dynamically loads evaluation metrics from results/tables json files."""
-    metrics = {"accuracy": 0.9780, "f1_macro": 0.9771, "val_acc": 0.9711}
+def load_evaluation_metrics() -> Optional[Dict[str, Any]]:
+    """
+    Dynamically loads evaluation metrics from actual results/tables JSON files.
+    Returns None if verified evaluation files do not exist (no hardcoded fallback numbers).
+    """
     for p in METRICS_PATHS:
         if os.path.exists(p):
             try:
                 with open(p, "r") as f:
                     data = json.load(f)
-                    metrics.update({k: v for k, v in data.items() if isinstance(v, (int, float))})
-                    break
+                    metrics = {k: v for k, v in data.items() if isinstance(v, (int, float))}
+                    metrics["source_file"] = p
+                    return metrics
             except Exception:
                 pass
-    return metrics
+    return None
 
 
 @st.cache_data(show_spinner=False)
@@ -149,15 +155,23 @@ def main():
         st.success("Trained Checkpoint Active")
         st.caption(f"Loaded: `{CKPT_PATH}`")
 
-        acc_pct = eval_metrics.get("accuracy", 0.978) * 100
-        f1_pct = eval_metrics.get("f1_macro", 0.977) * 100
-        val_acc_pct = eval_metrics.get("val_acc", 0.971) * 100
-
-        col_m1, col_m2 = st.columns(2)
-        with col_m1:
-            st.metric("Test Accuracy", f"{acc_pct:.2f}%")
-        with col_m2:
-            st.metric("Macro-F1", f"{f1_pct:.2f}%")
+        # Display actual evaluation metrics or explicit 'Not available'
+        if eval_metrics and "accuracy" in eval_metrics:
+            acc_pct = eval_metrics["accuracy"] * 100.0
+            f1_pct = eval_metrics.get("f1_macro", 0.0) * 100.0
+            col_m1, col_m2 = st.columns(2)
+            with col_m1:
+                st.metric("Test Accuracy", f"{acc_pct:.2f}%")
+            with col_m2:
+                st.metric("Macro-F1", f"{f1_pct:.2f}%")
+            st.caption(f"Metrics Source: `{eval_metrics.get('source_file')}`")
+        else:
+            col_m1, col_m2 = st.columns(2)
+            with col_m1:
+                st.metric("Test Accuracy", "Not available")
+            with col_m2:
+                st.metric("Macro-F1", "Not available")
+            st.caption("No precomputed metrics JSON file found.")
 
         st.metric("Trained Parameters", f"{model_meta['n_params']:,}")
         st.metric("Architecture", "BDH-GPU (Non-Causal)")
@@ -177,9 +191,9 @@ def main():
         st.markdown(
             """
             **🛰️ Spectral Band Handling:**
-            - **13-Band GeoTIFFs (`.tif`)**: Optimal input. Uses full spectral signatures (B01–B12 + B8A, including NIR and SWIR).
-            - **Large Satellite Scenes**: Automatically split via sliding window ($64\\times 64$) to generate 2D land-cover segmentation maps without distorting spatial scale.
-            - **RGB Images (`.png`, `.jpg`)**: Mapped to B04/B03/B02 with statistical NIR proxy estimation.
+            - **13-Band GeoTIFFs (`.tif`)**: Recommended primary input. Uses calibrated multi-spectral signatures (B01–B12 + B8A).
+            - **Large Satellite Scenes**: Decomposed via sliding window ($64\\times 64$) to generate a **tile-based land-cover classification map**.
+            - **RGB Images (`.png`, `.jpg`)**: Experimental demo only; non-RGB bands are synthetically approximated from dataset statistics.
             """
         )
 
@@ -215,6 +229,7 @@ def main():
                     st.session_state.input_array = sample_data["array"]
                     st.session_state.ground_truth_class = sample_data["class_name"]
                     st.session_state.is_multi_tile_scene = False
+                    st.session_state.is_synthetic_rgb = False
                     st.session_state.scene_results = None
                     st.session_state.single_results = None
                     st.session_state.input_source_desc = (
@@ -226,7 +241,7 @@ def main():
     # 2. Upload Tab
     with tab_upload:
         st.markdown(
-            "Upload a multi-spectral GeoTIFF (`.tif`, `.tiff`) or standard satellite image (`.png`, `.jpg`):"
+            "Upload a multi-spectral GeoTIFF (`.tif`, `.tiff`) or standard image (`.png`, `.jpg`):"
         )
         uploaded_file = st.file_uploader(
             "Select satellite image",
@@ -239,11 +254,15 @@ def main():
             try:
                 if fname.endswith((".tif", ".tiff")):
                     arr = load_geotiff(file_bytes)
+                    st.session_state.is_synthetic_rgb = False
                 else:
                     arr = load_rgb_image(file_bytes, mean_list)
+                    st.session_state.is_synthetic_rgb = True
                     st.warning(
-                        "Uploaded standard 3-band RGB image. Synthetic bands were estimated using dataset statistics. "
-                        "For full precision, use 13-band Sentinel-2 GeoTIFFs."
+                        "⚠️ **Experimental Demonstration Mode (Synthetic Spectral Bands)**: "
+                        "You uploaded a 3-band RGB image. Synthetic bands (including NIR and SWIR) were mathematically approximated "
+                        "from RGB channels and EuroSAT training statistics. For scientifically rigorous evaluation, upload genuine "
+                        "13-band Sentinel-2 GeoTIFF files or select from the benchmark test tiles."
                     )
 
                 _, H, W = arr.shape
@@ -253,12 +272,19 @@ def main():
                 st.session_state.is_multi_tile_scene = is_multi
                 st.session_state.scene_results = None
                 st.session_state.single_results = None
+                
+                type_desc = "Synthetic RGB Proxy" if st.session_state.is_synthetic_rgb else "Genuine Multi-Spectral Sentinel-2"
                 st.session_state.input_source_desc = (
-                    f"Uploaded File: `{uploaded_file.name}` • Dimensions: `{arr.shape[0]} bands, {H}×{W}px`"
+                    f"Uploaded File: `{uploaded_file.name}` • {arr.shape[0]} bands, {H}×{W}px • Type: {type_desc}"
                 )
-                st.success(f"File loaded successfully! Spatial dimensions: {H}×{W} pixels.")
+                if H < 64 or W < 64:
+                    st.info(
+                        f"Spatial dimensions ({H}×{W}) are smaller than BDH's 64×64 receptive field. "
+                        "Edge reflection padding will be automatically applied for model inference."
+                    )
+                st.success(f"File loaded successfully! Spatial dimensions: {H}×{W} pixels ({arr.shape[0]} bands).")
             except Exception as ex:
-                st.error(f"Error reading image: {ex}")
+                st.error(f"GeoTIFF Validation Error: {ex}")
 
     # 3. Demo Scenes Tab
     with tab_demo_files:
@@ -276,6 +302,7 @@ def main():
                     is_multi = (H > 64 or W > 64)
                     st.session_state.input_array = arr
                     st.session_state.is_multi_tile_scene = is_multi
+                    st.session_state.is_synthetic_rgb = False
                     st.session_state.scene_results = None
                     st.session_state.single_results = None
 
@@ -298,19 +325,32 @@ def main():
     if st.session_state.input_array is not None:
         input_array = st.session_state.input_array
         is_multi_tile = st.session_state.is_multi_tile_scene
+        is_synth = st.session_state.is_synthetic_rgb
         _, H, W = input_array.shape
 
         st.markdown("---")
 
-        # CASE A: Large Multi-Tile Satellite Scene (Sliding-Window Segmentation)
+        if is_synth:
+            st.warning(
+                "🧪 **Notice**: Active input is a synthetic RGB approximation. Results should be viewed as an interactive interface demo rather than validated Sentinel-2 radiometric predictions."
+            )
+
+        # CASE A: Large Multi-Tile Satellite Scene (Sliding-Window Land-Cover Mapping)
         if is_multi_tile:
             st.subheader(f"🗺️ Multi-Tile Satellite Scene ({H}×{W} pixels)")
             st.caption(st.session_state.input_source_desc)
 
-            tiles, coords, orig_shape = extract_sliding_tiles(input_array, tile_size=64, stride=64)
             st.info(
-                f"**Sliding Window Pipeline:** Decomposed {H}×{W} satellite scene into **{len(tiles)} standard 64×64 patches** "
-                f"(stride 64px) to preserve native 10m/pixel spatial resolution."
+                "ℹ️ **Spatial Mapping Note**: BDH is a patch-level classifier trained on 64×64 EuroSAT satellite tiles "
+                "(10m ground sampling distance, 640m×640m footprint). The output is a **tile-based land-cover classification map** "
+                "(each 64×64 spatial patch displays its dominant predicted class), **not** a pixel-wise semantic segmentation map. "
+                "Pixel-level segmentation requires dense prediction models (e.g. U-Net) trained on per-pixel annotated masks."
+            )
+
+            tiles, coords, orig_shape = extract_sliding_tiles(input_array, tile_size=64, stride=64)
+            st.markdown(
+                f"**Sliding Window Pipeline:** Decomposed {H}×{W} scene into **{len(tiles)} standard 64×64 patches** "
+                f"(stride 64px) to preserve native 10m/pixel spatial resolution without distortion."
             )
 
             col_s_left, col_s_right = st.columns([1, 1], gap="medium")
@@ -328,7 +368,7 @@ def main():
             with col_s_right:
                 st.image(
                     nir_scene,
-                    caption=f"False-Color Infrared Composite (NIR B08, Red B04, Green B03)",
+                    caption="False-Color Infrared Composite (NIR B08, Red B04, Green B03)",
                     use_container_width=True,
                 )
 
@@ -349,43 +389,49 @@ def main():
 
             if st.session_state.scene_results is not None:
                 res = st.session_state.scene_results
-                seg_map = res["seg_map"]
+                tile_map = res["tile_map"]
 
                 st.success(
                     f"Inference completed in **{res['total_latency_ms']:.1f} ms** across **{res['total_tiles']} patches** "
-                    f"({res['total_latency_ms']/res['total_tiles']:.2f} ms/tile on {DEVICE})!"
+                    f"({res['total_latency_ms']/max(1, res['total_tiles']):.2f} ms/tile on {DEVICE})!"
                 )
 
-                tab_map1, tab_map2 = st.tabs(["🗺️ Colorized Land-Cover Map", "🛰️ Blended Overlay on Satellite Imagery"])
+                tab_map1, tab_map2 = st.tabs([
+                    "🗺️ Colorized Tile-Based Land-Cover Map",
+                    "🛰️ Blended Overlay on Satellite Imagery"
+                ])
 
                 with tab_map1:
                     col_m1, col_m2 = st.columns([1.2, 1])
                     with col_m1:
-                        seg_img = render_landcover_map(seg_map)
+                        map_img = render_landcover_map(tile_map)
                         st.image(
-                            seg_img,
-                            caption="BDH Classified Land-Cover Map",
+                            map_img,
+                            caption="BDH Tile-Based Land-Cover Classification Map (64×64 Patch-Level Aggregation)",
                             use_container_width=True,
                         )
                     with col_m2:
                         st.markdown("#### Land-Cover Composition Breakdown:")
-                        comp_df = pd.DataFrame([
-                            {"Class": k, "Area Coverage": f"{v:.1f}%", "Percentage": v}
-                            for k, v in res["composition"].items()
-                        ]).sort_values("Percentage", ascending=False)
-                        st.dataframe(comp_df[["Class", "Area Coverage"]].reset_index(drop=True), use_container_width=True)
-                        st.bar_chart(comp_df.set_index("Class")["Percentage"], color="#0A6E6E")
+                        if res["composition"]:
+                            comp_df = pd.DataFrame([
+                                {"Class": k, "Area Coverage": f"{v:.1f}%", "Percentage": v}
+                                for k, v in res["composition"].items()
+                            ]).sort_values("Percentage", ascending=False)
+                            st.dataframe(comp_df[["Class", "Area Coverage"]].reset_index(drop=True), use_container_width=True)
+                            st.bar_chart(comp_df.set_index("Class")["Percentage"], color="#0A6E6E")
+                        else:
+                            st.write("No classified pixels.")
 
                 with tab_map2:
-                    alpha_val = st.slider("Segmentation Overlay Opacity", min_value=0.1, max_value=0.9, value=0.45, step=0.05)
-                    overlay_img = create_segmented_overlay(rgb_scene, seg_map, alpha=alpha_val)
+                    alpha_val = st.slider("Classification Overlay Opacity", min_value=0.1, max_value=0.9, value=0.45, step=0.05)
+                    overlay_img = create_segmented_overlay(rgb_scene, tile_map, alpha=alpha_val)
                     st.image(
                         overlay_img,
-                        caption=f"Blended Overlay ({int(alpha_val*100)}% Segmentation + True-Color Imagery)",
+                        caption=f"Blended Overlay ({int(alpha_val*100)}% Tile Classification + True-Color Imagery)",
                         use_container_width=True,
                     )
 
-        # CASE B: Single 64x64 Satellite Tile (Standard Benchmark Workflow)
+        # CASE B: Single Satellite Tile (Standard Benchmark Workflow)
         else:
             col_img, col_pred = st.columns([1, 1.25], gap="large")
 
@@ -409,9 +455,10 @@ def main():
                         use_container_width=True,
                     )
 
-                st.info(
-                    f"**Tensor Dimensions:** `(13, 64, 64)` • **Patches:** 64 ($8\\times 8$ grid) • **Embedding:** 256-dim"
-                )
+                if H < 64 or W < 64:
+                    st.info(f"Tile dimensions: `{arr.shape[0]} bands, {H}×{W}px` (padded to 64×64 for BDH receptive field)")
+                else:
+                    st.info(f"Tensor Dimensions: `(13, {H}, {W})` • Patches: 64 ($8\\times 8$ grid) • Embedding: 256-dim")
 
             # Column 2: Live BDH Model Inference
             with col_pred:
@@ -420,8 +467,9 @@ def main():
                 predict_clicked = st.button("🚀 Predict Land-Cover Class", type="primary", use_container_width=True, key="btn_single_infer")
 
                 if predict_clicked:
-                    # Normalize input tensor
-                    norm_tensor = normalize_batch([input_array], mean_t, std_t)
+                    # Pad to minimum receptive field if smaller than 64x64
+                    padded_arr, _ = pad_to_min_dimensions(input_array, min_h=64, min_w=64)
+                    norm_tensor = normalize_batch([padded_arr], mean_t, std_t)
                     pred_res = predict_single_tile(
                         model=model,
                         normalized_tensor=norm_tensor,
@@ -443,10 +491,13 @@ def main():
                     is_correct = (predicted_class == gt) if gt else None
                     status_color = "#0A6E6E" if (is_correct is None or is_correct) else "#B91C1C"
 
+                    synth_badge = "<span style='display:inline-block;background:#FEF3C7;color:#B45309;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;margin-bottom:6px;'>EXPERIMENTAL SYNTHETIC INPUT</span><br/>" if is_synth else ""
+
                     # Output Card
                     st.markdown(
                         f"""
                         <div style="background-color: {status_color}12; border: 2.5px solid {status_color}; border-radius: 12px; padding: 22px; text-align: center; margin-bottom: 20px;">
+                            {synth_badge}
                             <span style="font-size: 0.88rem; text-transform: uppercase; letter-spacing: 0.05em; color: {status_color}; font-weight: 700;">Predicted Land-Use Class</span>
                             <h1 style="margin: 8px 0; font-size: 2.6rem; color: {status_color};">{predicted_class}</h1>
                             <span style="font-size: 1.25rem; font-weight: 700;">Prediction Confidence: {confidence*100:.1f}%</span>
@@ -486,7 +537,7 @@ def main():
                                     "x_sparse (First Code)": f"{s['x_sparse']*100:.1f}%",
                                     "y_sparse (Attended)": f"{s['y_sparse']*100:.1f}%",
                                     "xy_sparse (Gated Code)": f"{s['xy_sparse']*100:.1f}%",
-                                })
+                                    })
                             st.dataframe(pd.DataFrame(sparse_rows).set_index("Level"))
                             st.caption(
                                 "Multiplicative gating ($u \\odot v$) drives activation sparsity to ~92%–93% zeros before decoding."

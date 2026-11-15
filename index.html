@@ -1331,26 +1331,14 @@ async function runInference() {
   }
 
   if (!result) {
-    // Realistic fallback based on trained weights
-    const latency = Math.round(11 + Math.random() * 4);
-    result = {
-      predicted_class: s.trueClass,
-      confidence: 0.985,
-      true_class: s.trueClass,
-      latency_ms: latency,
-      all_probs: [
-        { class_name: "AnnualCrop", prob: s.trueClass === "AnnualCrop" ? 0.985 : 0.002 },
-        { class_name: "Forest", prob: s.trueClass === "Forest" ? 0.996 : 0.001 },
-        { class_name: "HerbaceousVegetation", prob: s.trueClass === "HerbaceousVegetation" ? 0.975 : 0.003 },
-        { class_name: "Highway", prob: s.trueClass === "Highway" ? 0.932 : 0.005 },
-        { class_name: "Industrial", prob: s.trueClass === "Industrial" ? 0.961 : 0.004 },
-        { class_name: "Pasture", prob: s.trueClass === "Pasture" ? 0.978 : 0.002 },
-        { class_name: "PermanentCrop", prob: s.trueClass === "PermanentCrop" ? 0.962 : 0.003 },
-        { class_name: "Residential", prob: s.trueClass === "Residential" ? 0.974 : 0.003 },
-        { class_name: "River", prob: s.trueClass === "River" ? 0.984 : 0.002 },
-        { class_name: "SeaLake", prob: s.trueClass === "SeaLake" ? 0.997 : 0.001 }
-      ]
-    };
+    // Report clearly that live model inference is unavailable instead of showing fake mock predictions
+    document.getElementById("predClass").textContent = "Inference Unavailable";
+    document.getElementById("trueClass").textContent = s.trueClass || "--";
+    document.getElementById("predConf").textContent = "--";
+    document.getElementById("predLatency").textContent = "API Offline";
+    const listEl = document.getElementById("probBars");
+    listEl.innerHTML = "<div style='color: #E11D48; font-size: 0.85rem; padding: 12px 0;'>⚠️ Model inference service is offline or unreachable. Fake prediction fallbacks have been removed to preserve scientific accuracy. Run the backend or launch the primary Streamlit interface (<code>streamlit run streamlit_app.py</code>).</div>";
+    return;
   }
 
   // Update UI
