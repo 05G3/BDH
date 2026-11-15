@@ -2,16 +2,32 @@ import io
 import json
 import os
 import time
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 from PIL import Image
 import streamlit as st
 import torch
-import torch.nn.functional as F
 
-from models.classifier import BDHClassifier
-from utils.visualization import band_to_rgb
+from application.inference import (
+    load_bdh_model,
+    predict_single_tile,
+    predict_scene_sliding_window,
+)
+from application.preprocessing import (
+    load_geotiff,
+    load_rgb_image,
+    extract_sliding_tiles,
+    normalize_batch,
+)
+from application.visualization import (
+    CLASS_PALETTE,
+    get_rgb_preview,
+    get_nir_preview,
+    render_landcover_map,
+    create_segmented_overlay,
+)
 
 # -----------------------------------------------------------------------------
 # Configuration & Constants
@@ -29,6 +45,10 @@ STATS_PATH = "data/splits/norm_stats.json"
 TRAIN_CSV = "data/splits/train.csv"
 TEST_IMAGES_PATH = "data/processed/test_images.npy"
 TEST_LABELS_PATH = "data/processed/test_labels.npy"
+METRICS_PATHS = [
+    "results/tables/bdh_main_test_metrics.json",
+    "results/tables/bdh_main_s0_test_metrics.json",
+]
 
 DEFAULT_CLASSES = [
     "AnnualCrop", "Forest", "HerbaceousVegetation", "Highway", "Industrial",
@@ -42,43 +62,48 @@ if "input_source_desc" not in st.session_state:
     st.session_state.input_source_desc = ""
 if "ground_truth_class" not in st.session_state:
     st.session_state.ground_truth_class = None
+if "is_multi_tile_scene" not in st.session_state:
+    st.session_state.is_multi_tile_scene = False
+if "scene_results" not in st.session_state:
+    st.session_state.scene_results = None
+if "single_results" not in st.session_state:
+    st.session_state.single_results = None
 
 # -----------------------------------------------------------------------------
-# Cached Resources (Model, Stats, Classes, Test Samples)
+# Cached Resources (Model, Stats, Classes, Test Samples, Metrics)
 # -----------------------------------------------------------------------------
 @st.cache_resource(show_spinner=False)
-def load_model_and_metadata():
-    """Loads the trained BDH model and normalization statistics."""
+def get_cached_model():
+    """Loads and caches the trained BDH model."""
     if not os.path.exists(CKPT_PATH):
         raise FileNotFoundError(f"Checkpoint not found at '{CKPT_PATH}'.")
+    return load_bdh_model(CKPT_PATH, DEVICE)
 
-    ckpt = torch.load(CKPT_PATH, map_location=DEVICE)
-    model_cfg = ckpt["config"]
-    model = BDHClassifier(**model_cfg).to(DEVICE).eval()
-    model.load_state_dict(ckpt["model_state"])
 
-    # Load norm stats
+@st.cache_data(show_spinner=False)
+def load_normalization_stats() -> Tuple[torch.Tensor, torch.Tensor, List[float]]:
+    """Loads mean and standard deviation per Sentinel-2 band."""
     with open(STATS_PATH, "r") as f:
         stats = json.load(f)
     mean_t = torch.tensor(stats["mean"], dtype=torch.float32).view(1, 13, 1, 1)
     std_t = torch.tensor(stats["std"], dtype=torch.float32).view(1, 13, 1, 1)
+    return mean_t, std_t, stats["mean"]
 
-    # Class names
-    if os.path.exists(TRAIN_CSV):
-        train_df = pd.read_csv(TRAIN_CSV)
-        class_names = train_df.drop_duplicates("label").sort_values("label")["class"].tolist()
-    else:
-        class_names = DEFAULT_CLASSES
 
-    n_params = sum(p.numel() for p in model.parameters())
-    meta = {
-        "epoch": ckpt.get("epoch", 26),
-        "val_acc": ckpt.get("val_acc", 0.9711),
-        "n_params": n_params,
-        "config": model_cfg,
-    }
-
-    return model, mean_t, std_t, class_names, meta
+@st.cache_data(show_spinner=False)
+def load_evaluation_metrics() -> Dict[str, float]:
+    """Dynamically loads evaluation metrics from results/tables json files."""
+    metrics = {"accuracy": 0.9780, "f1_macro": 0.9771, "val_acc": 0.9711}
+    for p in METRICS_PATHS:
+        if os.path.exists(p):
+            try:
+                with open(p, "r") as f:
+                    data = json.load(f)
+                    metrics.update({k: v for k, v in data.items() if isinstance(v, (int, float))})
+                    break
+            except Exception:
+                pass
+    return metrics
 
 
 @st.cache_data(show_spinner=False)
@@ -104,52 +129,57 @@ def load_sample_library():
     return samples
 
 
-def preprocess_geotiff(file_bytes):
-    """Reads a 13-band Sentinel-2 GeoTIFF from raw bytes using rasterio."""
-    import rasterio
-    with rasterio.open(io.BytesIO(file_bytes)) as src:
-        arr = src.read().astype(np.float32)  # shape (C, H, W)
-    if arr.shape[0] < 13:
-        raise ValueError(f"GeoTIFF has only {arr.shape[0]} bands, but BDH expects all 13 Sentinel-2 bands.")
-    arr = arr[:13]
-    if arr.shape[1:] != (64, 64):
-        arr_t = torch.from_numpy(arr).unsqueeze(0)
-        arr_t = F.interpolate(arr_t, size=(64, 64), mode="bilinear", align_corners=False)
-        arr = arr_t.squeeze(0).numpy()
-    return arr
-
-
 # -----------------------------------------------------------------------------
 # Main Application UI
 # -----------------------------------------------------------------------------
 def main():
     try:
-        model, mean_t, std_t, class_names, meta = load_model_and_metadata()
+        model, model_meta = get_cached_model()
+        mean_t, std_t, mean_list = load_normalization_stats()
+        eval_metrics = load_evaluation_metrics()
         sample_library = load_sample_library()
+        class_names = DEFAULT_CLASSES
     except Exception as e:
         st.error(f"Error loading BDH model or resources: {e}")
         st.stop()
 
-    # Sidebar: Model Architecture & Status
+    # Sidebar: Model Architecture & Evaluation Status
     with st.sidebar:
         st.title("🛰️ BDH Model Status")
         st.success("Trained Checkpoint Active")
         st.caption(f"Loaded: `{CKPT_PATH}`")
+
+        acc_pct = eval_metrics.get("accuracy", 0.978) * 100
+        f1_pct = eval_metrics.get("f1_macro", 0.977) * 100
+        val_acc_pct = eval_metrics.get("val_acc", 0.971) * 100
+
+        col_m1, col_m2 = st.columns(2)
+        with col_m1:
+            st.metric("Test Accuracy", f"{acc_pct:.2f}%")
+        with col_m2:
+            st.metric("Macro-F1", f"{f1_pct:.2f}%")
+
+        st.metric("Trained Parameters", f"{model_meta['n_params']:,}")
         st.metric("Architecture", "BDH-GPU (Non-Causal)")
-        st.metric("Trained Parameters", f"{meta['n_params']:,}")
-        st.metric("Test Accuracy", "97.80%")
         st.metric("Device", str(DEVICE).upper())
 
         st.markdown("---")
         st.markdown("### 📋 10 Land-Cover Classes")
-        st.caption(", ".join(class_names))
+        for idx, c_name in enumerate(class_names):
+            color_rgb = CLASS_PALETTE.get(idx, (100, 100, 100))
+            hex_c = f"#{color_rgb[0]:02x}{color_rgb[1]:02x}{color_rgb[2]:02x}"
+            st.markdown(
+                f"<span style='display:inline-block;width:12px;height:12px;background-color:{hex_c};border-radius:2px;margin-right:6px;'></span> {c_name}",
+                unsafe_allow_html=True,
+            )
 
         st.markdown("---")
         st.markdown(
             """
-            **⚠️ Important Note for Evaluators:**
-            The BDH model was trained on **all 13 spectral bands** of Sentinel-2 (reflectance values, including Near-Infrared B08 and Shortwave-Infrared B11/B12).
-            - For guaranteed **>97% accuracy**, upload a **13-band Sentinel-2 GeoTIFF (`.tif`)** or select from the **Benchmark Test Tiles** tab.
+            **🛰️ Spectral Band Handling:**
+            - **13-Band GeoTIFFs (`.tif`)**: Optimal input. Uses full spectral signatures (B01–B12 + B8A, including NIR and SWIR).
+            - **Large Satellite Scenes**: Automatically split via sliding window ($64\\times 64$) to generate 2D land-cover segmentation maps without distorting spatial scale.
+            - **RGB Images (`.png`, `.jpg`)**: Mapped to B04/B03/B02 with statistical NIR proxy estimation.
             """
         )
 
@@ -160,170 +190,307 @@ def main():
         "using your **actual trained BDH (Bio-Data-Hybrid) neural network**."
     )
 
-    # Tabs for Input Source
+    # Input Options Tabs
     tab_samples, tab_upload, tab_demo_files = st.tabs([
         "📚 Benchmark Test Tiles (Recommended)",
-        "📤 Upload Your Own Satellite GeoTIFF (.tif)",
-        "📁 Ready Demo Files in Project",
+        "📤 Upload Satellite GeoTIFF / RGB Image",
+        "📁 Pre-Packaged Demo Scenes",
     ])
 
+    # 1. Benchmark Test Tiles Tab
     with tab_samples:
         st.markdown("Select a ground-truth satellite tile from the EuroSAT held-out test split:")
         if sample_library:
-            selected_class = st.selectbox(
-                "Choose Land-Cover Class:",
-                list(sample_library.keys()),
-                index=1,  # Default to Forest
-            )
-            if st.button("📥 Load Benchmark Tile", key="btn_load_sample"):
-                sample_data = sample_library[selected_class]
-                st.session_state.input_array = sample_data["array"]
-                st.session_state.ground_truth_class = sample_data["class_name"]
-                st.session_state.input_source_desc = (
-                    f"EuroSAT Test Split Tile #{sample_data['test_idx']} (Ground Truth: **{sample_data['class_name']}**)"
+            col_sel, col_btn = st.columns([3, 1])
+            with col_sel:
+                selected_class = st.selectbox(
+                    "Choose Land-Cover Class:",
+                    list(sample_library.keys()),
+                    index=1,  # Default to Forest
                 )
+            with col_btn:
+                st.markdown("<div style='height:28px;'></div>", unsafe_allow_html=True)
+                if st.button("📥 Load Benchmark Tile", key="btn_load_sample", use_container_width=True):
+                    sample_data = sample_library[selected_class]
+                    st.session_state.input_array = sample_data["array"]
+                    st.session_state.ground_truth_class = sample_data["class_name"]
+                    st.session_state.is_multi_tile_scene = False
+                    st.session_state.scene_results = None
+                    st.session_state.single_results = None
+                    st.session_state.input_source_desc = (
+                        f"EuroSAT Test Split Tile #{sample_data['test_idx']} (Ground Truth: **{sample_data['class_name']}**)"
+                    )
         else:
             st.info("Test dataset array not found in `data/processed/test_images.npy`.")
 
+    # 2. Upload Tab
     with tab_upload:
-        st.markdown("Upload a 13-band Sentinel-2 GeoTIFF file (`.tif` or `.tiff`):")
+        st.markdown(
+            "Upload a multi-spectral GeoTIFF (`.tif`, `.tiff`) or standard satellite image (`.png`, `.jpg`):"
+        )
         uploaded_file = st.file_uploader(
-            "Upload 13-band Sentinel-2 GeoTIFF",
-            type=["tif", "tiff"],
+            "Select satellite image",
+            type=["tif", "tiff", "png", "jpg", "jpeg"],
             key="file_uploader",
         )
         if uploaded_file is not None:
             file_bytes = uploaded_file.read()
+            fname = uploaded_file.name.lower()
             try:
-                st.session_state.input_array = preprocess_geotiff(file_bytes)
-                st.session_state.ground_truth_class = None
-                st.session_state.input_source_desc = f"Uploaded GeoTIFF: `{uploaded_file.name}` (13 bands, 64x64)"
-                st.success("GeoTIFF loaded successfully!")
-            except Exception as ex:
-                st.error(f"Error parsing GeoTIFF: {ex}")
+                if fname.endswith((".tif", ".tiff")):
+                    arr = load_geotiff(file_bytes)
+                else:
+                    arr = load_rgb_image(file_bytes, mean_list)
+                    st.warning(
+                        "Uploaded standard 3-band RGB image. Synthetic bands were estimated using dataset statistics. "
+                        "For full precision, use 13-band Sentinel-2 GeoTIFFs."
+                    )
 
+                _, H, W = arr.shape
+                is_multi = (H > 64 or W > 64)
+                st.session_state.input_array = arr
+                st.session_state.ground_truth_class = None
+                st.session_state.is_multi_tile_scene = is_multi
+                st.session_state.scene_results = None
+                st.session_state.single_results = None
+                st.session_state.input_source_desc = (
+                    f"Uploaded File: `{uploaded_file.name}` • Dimensions: `{arr.shape[0]} bands, {H}×{W}px`"
+                )
+                st.success(f"File loaded successfully! Spatial dimensions: {H}×{W} pixels.")
+            except Exception as ex:
+                st.error(f"Error reading image: {ex}")
+
+    # 3. Demo Scenes Tab
     with tab_demo_files:
-        st.markdown("Quickly test any pre-packaged `.tif` files included in the project `demo_images/` folder:")
+        st.markdown("Choose from pre-packaged Sentinel-2 demonstration files in `demo_images/`:")
         demo_files = [f for f in os.listdir("demo_images") if f.endswith(".tif")] if os.path.exists("demo_images") else []
         if demo_files:
-            chosen_demo = st.selectbox("Select Demo File:", sorted(demo_files))
-            if st.button("📥 Load Demo File", key="btn_load_demo"):
-                import rasterio
-                with rasterio.open(os.path.join("demo_images", chosen_demo)) as src:
-                    st.session_state.input_array = src.read().astype(np.float32)[:13]
-                st.session_state.ground_truth_class = chosen_demo.split("_")[0]
-                st.session_state.input_source_desc = f"Demo File: `{chosen_demo}` (Expected: **{st.session_state.ground_truth_class}**)"
-                st.success(f"Loaded {chosen_demo}!")
+            col_d_sel, col_d_btn = st.columns([3, 1])
+            with col_d_sel:
+                chosen_demo = st.selectbox("Select Demo File:", sorted(demo_files))
+            with col_d_btn:
+                st.markdown("<div style='height:28px;'></div>", unsafe_allow_html=True)
+                if st.button("📥 Load Demo File", key="btn_load_demo", use_container_width=True):
+                    arr = load_geotiff(os.path.join("demo_images", chosen_demo))
+                    _, H, W = arr.shape
+                    is_multi = (H > 64 or W > 64)
+                    st.session_state.input_array = arr
+                    st.session_state.is_multi_tile_scene = is_multi
+                    st.session_state.scene_results = None
+                    st.session_state.single_results = None
+
+                    if is_multi:
+                        st.session_state.ground_truth_class = None
+                        st.session_state.input_source_desc = (
+                            f"Composite Multi-Class Scene: `{chosen_demo}` ({H}×{W}px, {arr.shape[0]} bands)"
+                        )
+                    else:
+                        gt_name = chosen_demo.split("_")[0]
+                        st.session_state.ground_truth_class = gt_name
+                        st.session_state.input_source_desc = (
+                            f"Demo Tile: `{chosen_demo}` (Expected Class: **{gt_name}**)"
+                        )
+                    st.success(f"Loaded {chosen_demo} ({H}×{W}px)!")
 
     # -------------------------------------------------------------------------
     # Visualization & Inference Section
     # -------------------------------------------------------------------------
     if st.session_state.input_array is not None:
         input_array = st.session_state.input_array
-        st.markdown("---")
-        col_img, col_pred = st.columns([1, 1.25], gap="large")
+        is_multi_tile = st.session_state.is_multi_tile_scene
+        _, H, W = input_array.shape
 
-        # Column 1: Image Preprocessing & Inspection
-        with col_img:
-            st.subheader("Step 1 & 2: Preprocessing")
+        st.markdown("---")
+
+        # CASE A: Large Multi-Tile Satellite Scene (Sliding-Window Segmentation)
+        if is_multi_tile:
+            st.subheader(f"🗺️ Multi-Tile Satellite Scene ({H}×{W} pixels)")
             st.caption(st.session_state.input_source_desc)
 
-            # Generate True-Color RGB composite
-            rgb_preview = band_to_rgb(input_array)
-            st.image(
-                rgb_preview,
-                caption="True-Color RGB Composite (B04, B03, B02)",
-                use_container_width=True,
+            tiles, coords, orig_shape = extract_sliding_tiles(input_array, tile_size=64, stride=64)
+            st.info(
+                f"**Sliding Window Pipeline:** Decomposed {H}×{W} satellite scene into **{len(tiles)} standard 64×64 patches** "
+                f"(stride 64px) to preserve native 10m/pixel spatial resolution."
             )
 
-            # Show False-Color Infrared Composite (B08 NIR, B04 Red, B03 Green)
-            nir_preview = band_to_rgb(input_array, bands=(7, 3, 2))
-            with st.expander("Show False-Color Infrared (Vegetation NIR B08)"):
+            col_s_left, col_s_right = st.columns([1, 1], gap="medium")
+
+            rgb_scene = get_rgb_preview(input_array)
+            nir_scene = get_nir_preview(input_array)
+
+            with col_s_left:
                 st.image(
-                    nir_preview,
-                    caption="False-Color NIR Composite (B08, B04, B03)",
+                    rgb_scene,
+                    caption=f"True-Color RGB Satellite Scene ({H}×{W})",
                     use_container_width=True,
                 )
 
-            st.info(
-                f"**Tensor Dimensions:** `(13, 64, 64)` • **Patches:** 64 ($8\\times 8$ grid) • **Embedding:** 256-dim"
-            )
-
-        # Column 2: Live BDH Model Inference
-        with col_pred:
-            st.subheader("Step 3 & 4: Model Inference")
-
-            predict_clicked = st.button("🚀 Predict Land-Cover Class", type="primary", use_container_width=True)
-            if predict_clicked or ("last_pred" in st.session_state and st.session_state.get("last_arr_id") == id(input_array)):
-                # Normalization
-                x = torch.from_numpy(input_array).float().unsqueeze(0)
-                xn = (x - mean_t) / (std_t + 1e-6)
-
-                # Model forward pass
-                model.bdh.record_stats = True
-                t0 = time.perf_counter()
-                with torch.no_grad():
-                    logits = model(xn.to(DEVICE))
-                    probs = F.softmax(logits, dim=1)[0].cpu().numpy()
-                latency_ms = (time.perf_counter() - t0) * 1000
-
-                pred_idx = int(np.argmax(probs))
-                predicted_class = class_names[pred_idx]
-                confidence = float(probs[pred_idx])
-                sparsity_stats = model.bdh.stats
-
-                gt = st.session_state.ground_truth_class
-                is_correct = (predicted_class == gt) if gt else None
-                status_color = "#0A6E6E" if (is_correct is None or is_correct) else "#B91C1C"
-
-                # Prominent Output Card
-                st.markdown(
-                    f"""
-                    <div style="background-color: {status_color}12; border: 2.5px solid {status_color}; border-radius: 12px; padding: 22px; text-align: center; margin-bottom: 20px;">
-                        <span style="font-size: 0.88rem; text-transform: uppercase; letter-spacing: 0.05em; color: {status_color}; font-weight: 700;">Predicted Land-Use Class</span>
-                        <h1 style="margin: 8px 0; font-size: 2.6rem; color: {status_color};">{predicted_class}</h1>
-                        <span style="font-size: 1.25rem; font-weight: 700;">Prediction Confidence: {confidence*100:.1f}%</span>
-                        <br/>
-                        <span style="font-size: 0.85rem; color: #666;">Inference Latency: {latency_ms:.2f} ms ({DEVICE})</span>
-                        {f"<br/><b style='color:{status_color}; font-size:0.95rem;'>{'✅ Correct Prediction' if is_correct else '⚠️ Ground truth: ' + gt}</b>" if gt else ""}
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
+            with col_s_right:
+                st.image(
+                    nir_scene,
+                    caption=f"False-Color Infrared Composite (NIR B08, Red B04, Green B03)",
+                    use_container_width=True,
                 )
 
-                # Class Probabilities Bar Chart
-                st.markdown("#### Softmax Class Probabilities:")
-                prob_df = pd.DataFrame({
-                    "Class": class_names,
-                    "Probability": probs * 100.0,
-                }).sort_values("Probability", ascending=False)
+            st.markdown("### Model Scene Inference")
+            if st.button("🚀 Run BDH Land-Cover Mapping", type="primary", use_container_width=True, key="btn_scene_infer"):
+                with st.spinner(f"Classifying {len(tiles)} patches with BDH neural network..."):
+                    scene_res = predict_scene_sliding_window(
+                        model=model,
+                        tiles=tiles,
+                        coords=coords,
+                        orig_shape=orig_shape,
+                        mean_t=mean_t,
+                        std_t=std_t,
+                        device=DEVICE,
+                        class_names=class_names,
+                    )
+                    st.session_state.scene_results = scene_res
 
-                st.bar_chart(prob_df.set_index("Class"), color="#0A6E6E")
+            if st.session_state.scene_results is not None:
+                res = st.session_state.scene_results
+                seg_map = res["seg_map"]
 
-                # Top-3 Summary Table
-                st.markdown("#### Top-3 Predictions:")
-                top3_df = prob_df.head(3).copy()
-                top3_df["Probability"] = top3_df["Probability"].map(lambda p: f"{p:.2f}%")
-                st.table(top3_df.reset_index(drop=True))
+                st.success(
+                    f"Inference completed in **{res['total_latency_ms']:.1f} ms** across **{res['total_tiles']} patches** "
+                    f"({res['total_latency_ms']/res['total_tiles']:.2f} ms/tile on {DEVICE})!"
+                )
 
-                # BDH Internal Sparsity Diagnostics Expander
-                if sparsity_stats:
-                    with st.expander("🔬 BDH Internal Activation Sparsity Diagnostics"):
-                        st.markdown(
-                            "Fraction of exactly-zero activations after ReLU across the 4 weight-tied BDH levels:"
+                tab_map1, tab_map2 = st.tabs(["🗺️ Colorized Land-Cover Map", "🛰️ Blended Overlay on Satellite Imagery"])
+
+                with tab_map1:
+                    col_m1, col_m2 = st.columns([1.2, 1])
+                    with col_m1:
+                        seg_img = render_landcover_map(seg_map)
+                        st.image(
+                            seg_img,
+                            caption="BDH Classified Land-Cover Map",
+                            use_container_width=True,
                         )
-                        sparse_rows = []
-                        for lvl, s in enumerate(sparsity_stats, start=1):
-                            sparse_rows.append({
-                                "Level": f"Level {lvl}",
-                                "x_sparse (First Code)": f"{s['x_sparse']*100:.1f}%",
-                                "y_sparse (Attended)": f"{s['y_sparse']*100:.1f}%",
-                                "xy_sparse (Gated Code)": f"{s['xy_sparse']*100:.1f}%",
-                            })
-                        st.dataframe(pd.DataFrame(sparse_rows).set_index("Level"))
-                        st.caption(
-                            "Multiplicative gating ($u \\odot v$) drives activation sparsity to ~92%–93% zeros before decoding."
-                        )
+                    with col_m2:
+                        st.markdown("#### Land-Cover Composition Breakdown:")
+                        comp_df = pd.DataFrame([
+                            {"Class": k, "Area Coverage": f"{v:.1f}%", "Percentage": v}
+                            for k, v in res["composition"].items()
+                        ]).sort_values("Percentage", ascending=False)
+                        st.dataframe(comp_df[["Class", "Area Coverage"]].reset_index(drop=True), use_container_width=True)
+                        st.bar_chart(comp_df.set_index("Class")["Percentage"], color="#0A6E6E")
+
+                with tab_map2:
+                    alpha_val = st.slider("Segmentation Overlay Opacity", min_value=0.1, max_value=0.9, value=0.45, step=0.05)
+                    overlay_img = create_segmented_overlay(rgb_scene, seg_map, alpha=alpha_val)
+                    st.image(
+                        overlay_img,
+                        caption=f"Blended Overlay ({int(alpha_val*100)}% Segmentation + True-Color Imagery)",
+                        use_container_width=True,
+                    )
+
+        # CASE B: Single 64x64 Satellite Tile (Standard Benchmark Workflow)
+        else:
+            col_img, col_pred = st.columns([1, 1.25], gap="large")
+
+            # Column 1: Image Preprocessing & Spectral Inspection
+            with col_img:
+                st.subheader("Step 1 & 2: Preprocessing")
+                st.caption(st.session_state.input_source_desc)
+
+                rgb_preview = get_rgb_preview(input_array)
+                st.image(
+                    rgb_preview,
+                    caption="True-Color RGB Composite (B04, B03, B02)",
+                    use_container_width=True,
+                )
+
+                nir_preview = get_nir_preview(input_array)
+                with st.expander("Show False-Color Infrared (Vegetation NIR B08)"):
+                    st.image(
+                        nir_preview,
+                        caption="False-Color NIR Composite (B08, B04, B03)",
+                        use_container_width=True,
+                    )
+
+                st.info(
+                    f"**Tensor Dimensions:** `(13, 64, 64)` • **Patches:** 64 ($8\\times 8$ grid) • **Embedding:** 256-dim"
+                )
+
+            # Column 2: Live BDH Model Inference
+            with col_pred:
+                st.subheader("Step 3 & 4: Model Inference")
+
+                predict_clicked = st.button("🚀 Predict Land-Cover Class", type="primary", use_container_width=True, key="btn_single_infer")
+
+                if predict_clicked:
+                    # Normalize input tensor
+                    norm_tensor = normalize_batch([input_array], mean_t, std_t)
+                    pred_res = predict_single_tile(
+                        model=model,
+                        normalized_tensor=norm_tensor,
+                        device=DEVICE,
+                        record_stats=True,
+                    )
+                    st.session_state.single_results = pred_res
+
+                if st.session_state.single_results is not None:
+                    res = st.session_state.single_results
+                    probs = res["probabilities"]
+                    pred_idx = res["pred_idx"]
+                    predicted_class = class_names[pred_idx]
+                    confidence = res["confidence"]
+                    latency_ms = res["latency_ms"]
+                    sparsity_stats = res.get("sparsity_stats", [])
+
+                    gt = st.session_state.ground_truth_class
+                    is_correct = (predicted_class == gt) if gt else None
+                    status_color = "#0A6E6E" if (is_correct is None or is_correct) else "#B91C1C"
+
+                    # Output Card
+                    st.markdown(
+                        f"""
+                        <div style="background-color: {status_color}12; border: 2.5px solid {status_color}; border-radius: 12px; padding: 22px; text-align: center; margin-bottom: 20px;">
+                            <span style="font-size: 0.88rem; text-transform: uppercase; letter-spacing: 0.05em; color: {status_color}; font-weight: 700;">Predicted Land-Use Class</span>
+                            <h1 style="margin: 8px 0; font-size: 2.6rem; color: {status_color};">{predicted_class}</h1>
+                            <span style="font-size: 1.25rem; font-weight: 700;">Prediction Confidence: {confidence*100:.1f}%</span>
+                            <br/>
+                            <span style="font-size: 0.85rem; color: #666;">Inference Latency: {latency_ms:.2f} ms ({DEVICE})</span>
+                            {f"<br/><b style='color:{status_color}; font-size:0.95rem;'>{'✅ Correct Prediction' if is_correct else '⚠️ Ground truth: ' + gt}</b>" if gt else ""}
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+
+                    # Class Probabilities Bar Chart
+                    st.markdown("#### Softmax Class Probabilities:")
+                    prob_df = pd.DataFrame({
+                        "Class": class_names,
+                        "Probability": probs * 100.0,
+                    }).sort_values("Probability", ascending=False)
+
+                    st.bar_chart(prob_df.set_index("Class"), color="#0A6E6E")
+
+                    # Top-3 Predictions Table
+                    st.markdown("#### Top-3 Predictions:")
+                    top3_df = prob_df.head(3).copy()
+                    top3_df["Probability"] = top3_df["Probability"].map(lambda p: f"{p:.2f}%")
+                    st.table(top3_df.reset_index(drop=True))
+
+                    # BDH Internal Sparsity Diagnostics Expander
+                    if sparsity_stats:
+                        with st.expander("🔬 BDH Internal Activation Sparsity Diagnostics"):
+                            st.markdown(
+                                "Fraction of exactly-zero activations after ReLU across the 4 weight-tied BDH levels:"
+                            )
+                            sparse_rows = []
+                            for lvl, s in enumerate(sparsity_stats, start=1):
+                                sparse_rows.append({
+                                    "Level": f"Level {lvl}",
+                                    "x_sparse (First Code)": f"{s['x_sparse']*100:.1f}%",
+                                    "y_sparse (Attended)": f"{s['y_sparse']*100:.1f}%",
+                                    "xy_sparse (Gated Code)": f"{s['xy_sparse']*100:.1f}%",
+                                })
+                            st.dataframe(pd.DataFrame(sparse_rows).set_index("Level"))
+                            st.caption(
+                                "Multiplicative gating ($u \\odot v$) drives activation sparsity to ~92%–93% zeros before decoding."
+                            )
 
     st.markdown("---")
     st.caption(
